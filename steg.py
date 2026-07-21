@@ -118,3 +118,49 @@ def ws_decode(text: str) -> bytes:
         return _read_length_prefixed(bits)
     except ValueError:
         return b""
+
+
+# ---------------------------------------------------------------------------
+# Method: zero-width Unicode
+# Payload bits become U+200B (0) or U+200C (1) inserted after the first
+# visible character of the cover. The decoder scans the whole text and reads
+# every zero-width character regardless of position.
+# ---------------------------------------------------------------------------
+
+_ZWS = "\u200b"   # zero-width space     -> bit 0
+_ZWNJ = "\u200c"  # zero-width non-joiner -> bit 1
+_ZW_CHAR_TO_BIT = {_ZWS: "0", _ZWNJ: "1"}
+_BIT_TO_ZW_CHAR = {"0": _ZWS, "1": _ZWNJ}
+# chars we recognize as payload on decode; other zero-width chars are ignored
+_PAYLOAD_ZW_CHARS = frozenset(_ZW_CHAR_TO_BIT)
+
+
+def zw_encode(data: bytes, cover: str) -> str:
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not isinstance(cover, str):
+        raise TypeError("cover must be str")
+    if _PAYLOAD_ZW_CHARS & set(cover):
+        raise ValueError("cover text already contains payload zero-width chars")
+    payload = _length_prefix(data)
+    bits = _bytes_to_bits(payload)
+    zws = "".join(_BIT_TO_ZW_CHAR[b] for b in bits)
+    if not cover:
+        return zws
+    # insert all payload chars after the first character; placement is cosmetic
+    # because the decoder reads ALL zw chars regardless of position.
+    # ponytail: cluster after char[0] is detectable by steganalysis. Distribute
+    # evenly across the cover for resistance if needed.
+    return cover[0] + zws + cover[1:]
+
+
+def zw_decode(text: str) -> bytes:
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    bits = "".join(_ZW_CHAR_TO_BIT[ch] for ch in text if ch in _PAYLOAD_ZW_CHARS)
+    if len(bits) < 32:
+        return b""
+    try:
+        return _read_length_prefixed(bits)
+    except ValueError:
+        return b""

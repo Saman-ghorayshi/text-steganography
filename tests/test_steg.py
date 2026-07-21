@@ -182,3 +182,151 @@ def test_ws_multiline_cover_preserves_newline_count():
     encoded = ws_encode(b"\x00\x01\x02", cover)
     assert ws_decode(encoded) == b"\x00\x01\x02"
 
+
+# ---------------------------------------------------------------------------
+# zero-width method tests
+# ---------------------------------------------------------------------------
+
+from steg import zw_encode, zw_decode, _ZWS, _ZWNJ
+
+
+def test_zw_round_trip_basic():
+    data = b"test"
+    cover = "hello world"
+    encoded = zw_encode(data, cover)
+    assert zw_decode(encoded) == data
+
+
+def test_zw_invisible_to_naked_eye():
+    data = b"secret message"
+    cover = "plain text for cover"
+    encoded = zw_encode(data, cover)
+    # stripping payload chars should give back the cover text unchanged
+    cleaned = encoded.replace(_ZWS, "").replace(_ZWNJ, "")
+    assert cleaned == cover
+
+
+def test_zw_empty_data_round_trip():
+    data = b""
+    cover = "anything"
+    encoded = zw_encode(data, cover)
+    assert zw_decode(encoded) == data
+
+
+def test_zw_empty_cover():
+    data = b"x"
+    cover = ""
+    encoded = zw_encode(data, cover)
+    assert zw_decode(encoded) == data
+
+
+def test_zw_no_payload_chars_returns_empty():
+    # text with no zw chars → not enough bits for length header
+    assert zw_decode("just a regular sentence") == b""
+    assert zw_decode("") == b""
+
+
+def test_zw_random_fuzz_round_trip():
+    import random
+    random.seed(1337)
+    for _ in range(30):
+        n = random.randint(0, 200)
+        data = bytes(random.randint(0, 255) for _ in range(n))
+        cover = "".join(random.choice("abcdefghijklmnop ") for _ in range(random.randint(0, 50)))
+        encoded = zw_encode(data, cover)
+        assert zw_decode(encoded) == data, f"failed for n={n} data={data!r}"
+
+
+def test_zw_unicode_cover():
+    # cover with non-ASCII chars, just exercises slicing on surrogate-free text
+    data = b"hi"
+    cover = "سلام 世界"
+    encoded = zw_encode(data, cover)
+    assert zw_decode(encoded) == data
+
+
+def test_zw_truncated_returns_empty():
+    data = b"a pretty long payload here" * 5
+    cover = "cover"
+    encoded = zw_encode(data, cover)
+    # strip the last 80% of zw chars → declared length won't fit
+    # we strip by removing trailing chars; since payload is in the middle,
+    # we just cut the encoded text in half. zw chars at the end fall off.
+    half = encoded[: len(encoded) // 2]
+    assert zw_decode(half) == b""
+
+
+def test_zw_preserves_cover_when_payload_chars_stripped():
+    cover = "the actual text"
+    encoded = zw_encode(b"data", cover)
+    stripped = "".join(c for c in encoded if c not in (_ZWS, _ZWNJ))
+    assert stripped == cover
+
+
+def test_zw_other_zero_width_chars_ignored_on_decode():
+    # cover could accidentally contain U+200D (zw joiner), U+FEFF (BOM) etc.
+    # decoder only reads U+200B and U+200C as payload
+    import os
+    data = os.urandom(32)
+    cover = f"prefix\u200d suffix"  # has a ZWJ we don't use
+    encoded = zw_encode(data, cover)
+    decoded = zw_decode(encoded)
+    assert decoded == data
+    # the ZWJ in cover must survive (we don't strip it, we just ignore on decode)
+    assert "\u200d" in encoded
+
+
+def test_zw_rejects_cover_with_payload_chars():
+    with pytest.raises(ValueError):
+        zw_encode(b"x", "cover with " + _ZWS)
+    with pytest.raises(ValueError):
+        zw_encode(b"x", "cover with " + _ZWNJ)
+
+
+def test_zw_ends_with_first_char_intact():
+    cover = "abcdef"
+    encoded = zw_encode(b"x", cover)
+    # cover[0] should still be the first char of encoded
+    assert encoded[0] == cover[0]
+
+
+# ---------------------------------------------------------------------------
+# end-to-end: encrypt + stego + extract + decrypt for both methods
+# ---------------------------------------------------------------------------
+
+from steg import encrypt_message, decrypt_message
+
+
+def test_end_to_end_zw():
+    secret = "meet at dawn at the docks"
+    password = "horse battery staple"
+    cover = "hi mom, the weather is fine today. love you."
+    ct = encrypt_message(secret.encode("utf-8"), password)
+    stego = zw_encode(ct, cover)
+    # stego text looks identical to cover when zw chars are stripped
+    assert "".join(c for c in stego if c not in (_ZWS, _ZWNJ)) == cover
+    # decode + decrypt recovers the secret
+    recovered_ct = zw_decode(stego)
+    assert decrypt_message(recovered_ct, password) == secret.encode("utf-8")
+
+
+def test_end_to_end_ws():
+    secret = "meet at dawn at the docks"
+    password = "horse battery staple"
+    cover = "\n".join(f"line {i}" for i in range(500))
+    ct = encrypt_message(secret.encode("utf-8"), password)
+    stego = ws_encode(ct, cover)
+    recovered_ct = ws_decode(stego)
+    assert decrypt_message(recovered_ct, password) == secret.encode("utf-8")
+
+
+def test_end_to_end_wrong_password_fails():
+    secret = "the answer is 42"
+    cover = "some cover" * 50
+    ct = encrypt_message(secret.encode("utf-8"), "right")
+    stego = zw_encode(ct, cover)
+    recovered_ct = zw_decode(stego)
+    with pytest.raises(InvalidToken):
+        decrypt_message(recovered_ct, "wrong")
+
+
