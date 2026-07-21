@@ -83,3 +83,102 @@ def test_type_errors():
         encrypt_message(b"x", b"pw")  # password must be str not bytes
     with pytest.raises(TypeError):
         decrypt_message("not bytes", "pw")
+
+
+# ---------------------------------------------------------------------------
+# whitespace method tests
+# ---------------------------------------------------------------------------
+
+from steg import ws_encode, ws_decode, _bytes_to_bits, _bits_to_bytes
+
+
+def test_bits_round_trip():
+    data = bytes(range(256))
+    bits = _bytes_to_bits(data)
+    assert len(bits) == 256 * 8
+    assert _bits_to_bytes(bits) == data
+
+
+def test_ws_round_trip_basic():
+    data = b"hello"
+    cover = "line one\nline two\nline three\nline four\nline five"
+    encoded = ws_encode(data, cover)
+    assert ws_decode(encoded) == data
+
+
+def test_ws_visible_text_preserved():
+    data = b"hidden payload"
+    cover = "alpha\nbeta\ngamma\ndelta\nepsilon"
+    encoded = ws_encode(data, cover)
+    restored = "\n".join(line.rstrip(" \t") for line in encoded.split("\n"))
+    # remove padding empty lines the encoder may have added at the end
+    stripped = "\n".join(x for x in restored.split("\n") if x != "")
+    assert stripped == cover
+
+
+def test_ws_empty_data_uses_only_length_header():
+    data = b""
+    cover = "abc\ndef\nghi\njkl"  # 4 lines, need exactly 32 bits = 32 lines
+    encoded = ws_encode(data, cover)
+    assert ws_decode(encoded) == b""
+
+
+def test_ws_cover_too_small_pads_with_empty_lines():
+    # cover has 1 line, payload needs more bits → padding lines added
+    data = b"x" * 4  # 32 header bits + 32 payload bits = 64 lines
+    cover = "only one line"
+    encoded = ws_encode(data, cover)
+    assert ws_decode(encoded) == data
+
+
+def test_ws_empty_cover():
+    data = b"x"
+    cover = ""
+    encoded = ws_encode(data, cover)
+    assert ws_decode(encoded) == data
+
+
+def test_ws_no_payload_signal_returns_empty():
+    # text with NO trailing whitespace → length header is 0 bits → returns b""
+    assert ws_decode("just a regular sentence") == b""
+    assert ws_decode("") == b""
+
+
+def test_ws_truncated_payload_returns_empty():
+    # encode then truncate the encoded text so the declared length can't fit
+    data = b"something long enough"
+    cover = "\n".join(f"line {i}" for i in range(200))  # plenty of lines
+    encoded = ws_encode(data, cover)
+    # chop off the trailing portion (destroy required payload bits)
+    truncated = encoded[: len(encoded) // 2]
+    assert ws_decode(truncated) == b""
+
+
+def test_ws_random_fuzz_round_trip():
+    import os
+    import random
+    random.seed(42)
+    for _ in range(20):
+        n = random.randint(0, 100)
+        data = bytes(random.randint(0, 255) for _ in range(n))
+        cover_lines = [
+            "".join(random.choice("abcdefghijklmnop") for _ in range(random.randint(1, 20)))
+            for _ in range(random.randint(max(1, n * 8 + 32), n * 8 + 64))
+        ]
+        cover = "\n".join(cover_lines)
+        encoded = ws_encode(data, cover)
+        assert ws_decode(encoded) == data, f"failed for n={n} data={data!r}"
+
+
+def test_ws_rejects_cover_with_embedded_tab():
+    with pytest.raises(ValueError):
+        ws_encode(b"x", "line with\ttab")
+    with pytest.raises(ValueError):
+        ws_encode(b"x", "trailing space ")
+
+
+def test_ws_multiline_cover_preserves_newline_count():
+    cover = "a\nb\nc\nd\ne\nf\ng\nh"
+    encoded = ws_encode(b"\x00\x01\x02", cover)
+    assert ws_decode(encoded) == b"\x00\x01\x02"
+
