@@ -175,6 +175,28 @@ def zw_decode(text: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Method: image (PNG LSB)
+# Payload bits become the LSB of consecutive RGB channel bytes, walked in
+# scan order (row-major, R->G->B per pixel). Alpha is skipped so transparency
+# stays identical. Pillow is a SOFT import: text-only users don't need it.
+# ---------------------------------------------------------------------------
+
+def img_capacity(width: int, height: int) -> int:
+    """Bytes of ciphertext an image of given dims can hide via RGB-channel LSB.
+
+    3 channel bytes per pixel, one bit each, minus the 4-byte length header.
+    Raises ValueError on non-positive dims, TypeError on non-int input.
+    """
+    if not isinstance(width, int) or isinstance(width, bool):
+        raise TypeError("width must be int")
+    if not isinstance(height, int) or isinstance(height, bool):
+        raise TypeError("height must be int")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"dims must be positive, got {width}x{height}")
+    return (width * height * 3) // 8 - 4
+
+
+# ---------------------------------------------------------------------------
 # Steganalysis helper: detect payload + read declared length WITHOUT password.
 # Demonstrates the boundary: steganography hides content, not existence.
 # Uses the same bit readers as the encoders; payload chars survive identifying.
