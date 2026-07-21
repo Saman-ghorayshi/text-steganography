@@ -71,9 +71,22 @@ python steg.py encode -m zw -p mypw -s "secret" < cover.txt > stego.txt
 python steg.py decode -m zw -p mypw < stego.txt
 ```
 
+Detect hidden payload without decrypting (no password required):
+
+```
+python steg.py detect -m zw -i stego.txt
+python steg.py detect -m zw --json -i stego.txt | jq .
+```
+
+Same information without decrypting, from the decode verb:
+
+```
+python steg.py decode -m zw -p wrongpassword --analyze -i stego.txt
+```
+
 Exit codes:
 - `0` - success
-- `2` - input error (bad cover text, no payload found, missing args)
+- `2` - input error (bad cover text, no payload found, missing args, no payload in detect)
 - `3` - decryption failed (wrong password or corrupted payload)
 
 ## Using the library directly
