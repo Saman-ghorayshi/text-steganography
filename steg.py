@@ -301,20 +301,114 @@ def img_decode(stego_png: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def analyze(text: str, method: str) -> dict:
+def _analyze_img(png_bytes) -> dict:
+    """Steganalysis on a PNG: read LSB-payload length header and report an
+    LSB-distribution snapshot. No password. 'suspicious' is intentionally
+    conservative: a readable non-zero declared length that fits inside the
+    image's LSB capacity is itself the steganographic signal — random LSB
+    noise produces a declared length of 0 or a value > capacity. Real
+    portfolios want a chi-square steganalyzer; this is the honest minimum.
+    """
+    if not isinstance(png_bytes, (bytes, bytearray)):
+        raise TypeError("img analyze input must be bytes")
+    if not isinstance(png_bytes, bytes):
+        png_bytes = bytes(png_bytes)
+
+    Image = _require_pil()
+    import io as _io
+    try:
+        img = Image.open(_io.BytesIO(png_bytes))
+    except Exception as e:
+        raise ValueError(f"stego is not a readable image: {e}")
+    img.load()
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    pixels = list(img.getdata())
+
+    total_channels = 0
+    ones = 0
+    bits = ""
+    for px in pixels:
+        for ch in range(3):
+            b = px[ch] & 1
+            bits += str(b)
+            total_channels += 1
+            if b:
+                ones += 1
+    zeros = total_channels - ones
+    pct_ones = ones / total_channels if total_channels else 0.0
+
+    base = {
+        "method": "img",
+        "lsb_distribution": {
+            "total_channels": total_channels,
+            "ones": ones,
+            "zeros": zeros,
+            "pct_ones": round(pct_ones, 4),
+        },
+        "declared_length": None,
+        "header_corrupted": False,
+        "suspicious": False,
+        "reason": None,
+        # mirror text keys so generic _print_analysis can render summary fields
+        "payload_chars": total_channels,
+        "payload_byte_count": total_channels // 8,
+    }
+
+    if len(bits) < 32:
+        return base
+    declared = int(bits[:32], 2)
+    total_bytes = (total_channels - 32) // 8
+    if declared == 0:
+        # an all-zero LSB header reads length 0 — no payload. Don't flag.
+        base["declared_length"] = None  # treat like "no readable header"
+        return base
+    declared_fits = declared * 8 + 32 <= total_channels
+    if not declared_fits:
+        base["declared_length"] = declared
+        base["header_corrupted"] = True
+        base["suspicious"] = True
+        base["reason"] = (
+            f"declared {declared} bytes but image only stores {total_bytes} LSB bytes"
+        )
+        return base
+    base["declared_length"] = declared
+    base["suspicious"] = True
+    base["reason"] = (
+        f"LSB stream contains a readable length header declaring {declared} "
+        f"bytes of payload that fits the image capacity "
+        f"({total_bytes} LSB bytes) — random LSB noise would not"
+    )
+    return base
+
+
+def analyze(text, method: str) -> dict:
     """Report on whether `text` carries a hidden payload via `method`.
 
-    Returns a dict with keys:
+    For text methods (ws, zw), `text` is a str. For `method == 'img'`,
+    `text` is the stego PNG bytes.
+
+    Returns a dict with keys (text methods):
       method              - the method passed in
       payload_chars      - how many payload characters were found
       payload_byte_count - floor(payload_chars / 8), what would be decoded
       declared_length     - length read from the 4-byte header (int or None)
       header_corrupted    - bool: header bits were present but produced a
                             length that exceeds the available payload bytes
+    For method == 'img' adds:
+      lsb_distribution   - dict {total_channels, ones, zeros, pct_ones}
+      suspicious         - bool: did the LSB stream look structured?
+                           (readable non-zero declared length that fits the
+                           image is, itself, the steganographic signal)
+      reason             - str when suspicious is True, else None
     No password required. Does not decrypt.
     """
-    if method not in ("ws", "zw"):
+    if method not in ("ws", "zw", "img"):
         raise ValueError(f"unknown method: {method!r}")
+
+    if method == "img":
+        return _analyze_img(text)
+
     if not isinstance(text, str):
         raise TypeError("text must be str")
 
@@ -455,6 +549,9 @@ def _print_analysis(result: dict, json_output: bool) -> None:
     if json_output:
         print(json.dumps(result))
         return
+    if result["method"] == "img":
+        _print_analysis_img(result)
+        return
     if result["payload_chars"] == 0:
         print(f"[{result['method']}] no payload characters found")
         return
@@ -469,6 +566,25 @@ def _print_analysis(result: dict, json_output: bool) -> None:
     print(f"[{result['method']}] {result['payload_chars']} payload chars - "
           f"{result['payload_byte_count']} bytes encoded, declared "
           f"{declared} bytes payload{note}")
+
+
+def _print_analysis_img(result: dict) -> None:
+    """Human render of an img analyze() result."""
+    d = result["lsb_distribution"]
+    print(f"[img] {d['total_channels']} LSB channel bits "
+          f"({d['ones']} ones / {d['zeros']} zeros, "
+          f"{d['pct_ones']*100:.2f}% ones)")
+    if result["declared_length"] is None:
+        if not result["suspicious"]:
+            print("[img] no readable length header in LSB stream")
+        return
+    declared = result["declared_length"]
+    note = " (header looks corrupted: declared length exceeds LSB capacity)" \
+        if result["header_corrupted"] else ""
+    flag = "SUSPICIOUS" if result["suspicious"] else "ok"
+    print(f"[img] declared {declared} bytes payload{note} — {flag}")
+    if result["reason"]:
+        print(f"[img] reason: {result['reason']}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -511,8 +627,8 @@ def _build_parser() -> argparse.ArgumentParser:
     det = sub.add_parser("detect",
                          help="steganalysis: detect hidden payload WITHOUT the "
                               "password. Reads the declared length header.")
-    det.add_argument("-m", "--method", choices=["ws", "zw"], required=True,
-                      help="ws = whitespace, zw = zero-width Unicode")
+    det.add_argument("-m", "--method", choices=["ws", "zw", "img"], required=True,
+                      help="ws = whitespace, zw = zero-width, img = PNG LSB")
     det.add_argument("-i", "--input", default="-",
                      help="input text to analyze (default: stdin)")
     det.add_argument("--json", action="store_true",
@@ -542,9 +658,14 @@ def main(argv=None) -> int:
 
     if args.command == "decode":
         if args.method == "img" and args.analyze:
-            # not yet supported for img: no analyze() impl in commit 3.
-            print(f"error: --analyze does not yet support method 'img'", file=sys.stderr)
-            return 2
+            try:
+                png = _read_bytes(args.input)
+                result = analyze(png, "img")
+            except (ValueError, TypeError, ImportError) as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            _print_analysis(result, json_output=False)
+            return 0 if result["declared_length"] is not None else 2
         if args.method == "img":
             try:
                 stego = _read_bytes(args.input)
@@ -585,10 +706,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "detect":
-        text = _read_text(args.input)
         try:
-            result = analyze(text, args.method)
-        except (ValueError, TypeError) as e:
+            data = _read_bytes(args.input) if args.method == "img" else _read_text(args.input)
+            result = analyze(data, args.method)
+        except (ValueError, TypeError, ImportError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
         _print_analysis(result, json_output=args.json)

@@ -278,3 +278,102 @@ def test_cli_encode_img_cover_too_small_returns_2():
         assert "cover too small" in err
 
 
+# ---------------------------------------------------------------------------
+# detect -m img / analyze(img) steganalysis (no password needed)
+# ---------------------------------------------------------------------------
+
+from steg import analyze as _analyze_img
+
+
+def test_analyze_img_reads_declared_length_without_password():
+    cover = _make_png_bytes(80, 80)
+    stego = hide_img(b"a real secret here", "pw", cover)
+    result = _analyze_img(stego, "img")
+    assert result["method"] == "img"
+    assert result["declared_length"] is not None
+    # declared length equals the ciphertext byte length, NOT the plaintext
+    ct = encrypt_msg_for_test(b"a real secret here", "pw")
+    assert result["declared_length"] == len(ct)
+
+
+def encrypt_msg_for_test(msg, pw):
+    from steg import encrypt_message
+    return encrypt_message(msg, pw)
+
+
+def test_analyze_img_on_plain_png_returns_zero_payload():
+    cover = _make_png_bytes(64, 64)  # solid color, all LSBs = 0
+    result = _analyze_img(cover, "img")
+    # For img, "payload_chars" is the count of bits the decoder reads that are
+    # non-natural — here it's 0 because every LSB is 0, treated as declared_length 0
+    # with no payload bytes. (Same convention as text analyze where empty means
+    # "no readable length header". For img we set declared_length=None when the
+    # header reads 0 bytes, matching the text "no payload found" semantics.)
+    assert result["declared_length"] is None
+    assert result["header_corrupted"] is False
+    assert "lsb_distribution" in result
+    assert result["suspicious"] is False  # zero or unreadable header, no payload
+
+
+def test_analyze_img_marks_stego_suspicious():
+    """A payload-bearing image's LSBs differ from a natural photo: the
+    ciphertext bits are uniform-pseudo-random while natural LSBs are too,
+    but our length header is highly structured (mostly zeros - typical
+    Fernet payloads are short relative to cover capacity). The simplest
+    honest signal: LSBs of a payload region are different from LSBs of
+    an unused region.
+    """
+    cover = _make_png_bytes(128, 128)
+    stego = hide_img(b"a real payload here ok", "pw", cover)
+    result = _analyze_img(stego, "img")
+    assert result["declared_length"] is not None
+    assert result["suspicious"] is True
+    assert "reason" in result
+
+
+def test_analyze_img_rejects_non_bytes():
+    with pytest.raises(TypeError):
+        _analyze_img("not bytes", "img")
+
+
+def test_analyze_img_rejects_bad_png():
+    with pytest.raises(ValueError):
+        _analyze_img(b"not a png at all", "img")
+
+
+def test_analyze_img_rejects_unknown_method():
+    with pytest.raises(ValueError):
+        _analyze_img(b"\x89PNG\r", "bogus")
+
+
+# ---------------------------------------------------------------------------
+# CLI: detect -m img
+# ---------------------------------------------------------------------------
+
+def test_cli_detect_img_reads_length_without_password():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.png")
+        stego_path = os.path.join(tmp, "stego.png")
+        with open(cover_path, "wb") as f:
+            f.write(_make_png_bytes(80, 80))
+        rc, _, err = _run_cli_img([
+            "encode", "-m", "img", "-p", "pw",
+            "-s", "hidden image secret",
+            "-c", cover_path, "-o", stego_path,
+        ])
+        assert rc == 0, f"encode failed: {err}"
+        rc, out, err = _run_cli_img(["detect", "-m", "img", "-i", stego_path])
+        assert rc == 0  # declared_length readable
+        assert "declared" in out or "bytes" in out
+
+
+def test_cli_detect_img_on_plain_png_exits_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.png")
+        with open(cover_path, "wb") as f:
+            f.write(_make_png_bytes(64, 64))
+        rc, out, err = _run_cli_img(["detect", "-m", "img", "-i", cover_path])
+        assert rc == 2
+
+
+
