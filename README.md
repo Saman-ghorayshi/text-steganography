@@ -2,7 +2,7 @@
 
 Hide secret messages inside plain text using two steganography methods, with password-based encryption. The hidden bytes are AES-encrypted before encoding, so even if an attacker detects the payload, they cannot read the message without the password.
 
-Live demo: https://samsha.github.io/text-steganography/
+Live demo: https://saman-ghorayshi.github.io/text-steganography/
 
 A self-contained browser demo (single HTML file, no dependencies, no backend) implements the same encryption and steganography in JavaScript using the Web Crypto API. Open the demo, hide a message in some cover text, send the result, and the recipient can extract it with the password.
 
