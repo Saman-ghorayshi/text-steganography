@@ -37,8 +37,8 @@ def main() -> int:
     print("------------------------------------")
 
     username = ask("GitHub username: ")
-    if not username or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", username):
-        print("error: invalid username")
+    if not username or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", username):
+        print("error: invalid username (must start with a letter)")
         return 2
 
     full_name = ask(f"Name for LICENSE copyright (enter for '{username}'): ") or username
