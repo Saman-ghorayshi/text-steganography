@@ -80,9 +80,17 @@ def ws_encode(data: bytes, cover: str) -> str:
         raise TypeError("data must be bytes")
     if not isinstance(cover, str):
         raise TypeError("cover must be str")
-    if "\t" in cover or cover != cover.rstrip(" \t\n"):
-        # Existing trailing whitespace would be misread as payload bits on decode.
-        raise ValueError("cover text must not contain tabs or trailing whitespace/blank lines")
+    if "\t" in cover:
+        # Existing tabs would be misread as payload bits on decode.
+        raise ValueError("cover text must not contain tabs")
+    # Trailing whitespace on any non-empty line would be misread as payload.
+    # A trailing newline is fine (it's just a line separator).
+    for i, line in enumerate(cover.split("\n")):
+        if line != line.rstrip(" \t"):
+            raise ValueError(
+                f"cover text line {i} has trailing whitespace, "
+                "would be misread as payload on decode"
+            )
     payload = _length_prefix(data)
     bits = _bytes_to_bits(payload)
     lines = cover.split("\n")
@@ -164,3 +172,120 @@ def zw_decode(text: str) -> bytes:
         return _read_length_prefixed(bits)
     except ValueError:
         return b""
+
+
+# ---------------------------------------------------------------------------
+# High-level convenience wrappers (encrypt+encode, decode+decrypt in one call)
+# ---------------------------------------------------------------------------
+
+def hide(secret: bytes, password: str, cover: str, method: str) -> str:
+    """Encrypt then stego-encode. method is 'ws' or 'zw'."""
+    ct = encrypt_message(secret, password)
+    if method == "ws":
+        return ws_encode(ct, cover)
+    if method == "zw":
+        return zw_encode(ct, cover)
+    raise ValueError(f"unknown method: {method!r}")
+
+
+def reveal(stego_text: str, password: str, method: str) -> bytes:
+    """Stego-decode then decrypt. Returns the original secret bytes."""
+    if method == "ws":
+        ct = ws_decode(stego_text)
+    elif method == "zw":
+        ct = zw_decode(stego_text)
+    else:
+        raise ValueError(f"unknown method: {method!r}")
+    if not ct:
+        raise ValueError("no hidden message found in input")
+    return decrypt_message(ct, password)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+import argparse
+import sys
+
+
+def _read_text(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _write_text(path: str, text: str) -> None:
+    if path == "-":
+        sys.stdout.write(text)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="steg",
+        description="Hide and extract secret messages in plain text using "
+                    "whitespace or zero-width Unicode steganography.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    enc = sub.add_parser("encode", help="hide a secret message in cover text")
+    enc.add_argument("-m", "--method", choices=["ws", "zw"], required=True,
+                      help="ws = whitespace (space/tab at end of lines), "
+                           "zw = zero-width Unicode chars")
+    enc.add_argument("-p", "--password", required=True, help="encryption password")
+    enc.add_argument("-s", "--secret", required=True, help="secret message text to hide")
+    enc.add_argument("-c", "--cover", default="-",
+                      help="cover text file (default: stdin)")
+    enc.add_argument("-o", "--output", default="-",
+                      help="output file for stego text (default: stdout)")
+
+    dec = sub.add_parser("decode", help="extract a secret message from stego text")
+    dec.add_argument("-m", "--method", choices=["ws", "zw"], required=True,
+                      help="ws = whitespace, zw = zero-width Unicode")
+    dec.add_argument("-p", "--password", required=True, help="decryption password")
+    dec.add_argument("-i", "--input", default="-",
+                     help="input stego text (default: stdin)")
+    dec.add_argument("-o", "--output", default="-",
+                     help="output file for secret (default: stdout)")
+
+    # ponytail: skipped - analyze subcommand to detect whether a text contains
+    # hidden stego payload without the password. Add when needed.
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "encode":
+        cover = _read_text(args.cover)
+        try:
+            stego = hide(args.secret.encode("utf-8"), args.password, cover, args.method)
+        except (ValueError, TypeError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        _write_text(args.output, stego)
+        return 0
+
+    if args.command == "decode":
+        stego = _read_text(args.input)
+        try:
+            secret = reveal(stego, args.password, args.method)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        except InvalidToken:
+            print("error: wrong password or corrupted payload", file=sys.stderr)
+            return 3
+        _write_text(args.output, secret.decode("utf-8"))
+        return 0
+
+    parser.error(f"unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

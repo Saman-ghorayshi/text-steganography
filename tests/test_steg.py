@@ -1,4 +1,5 @@
 import base64
+import sys
 import pytest
 from cryptography.fernet import InvalidToken
 
@@ -328,5 +329,145 @@ def test_end_to_end_wrong_password_fails():
     recovered_ct = zw_decode(stego)
     with pytest.raises(InvalidToken):
         decrypt_message(recovered_ct, "wrong")
+
+
+# ---------------------------------------------------------------------------
+# hide / reveal convenience wrappers
+# ---------------------------------------------------------------------------
+
+from steg import hide, reveal
+
+
+def test_hide_reveal_zw():
+    secret = b"the eagle flies at midnight"
+    stego = hide(secret, "pw", "this is just a cover message", "zw")
+    assert reveal(stego, "pw", "zw") == secret
+
+
+def test_hide_reveal_ws():
+    secret = b"the eagle flies at midnight"
+    cover = "\n".join(f"line {i}" for i in range(400))
+    stego = hide(secret, "pw", cover, "ws")
+    assert reveal(stego, "pw", "ws") == secret
+
+
+def test_hide_invalid_method():
+    with pytest.raises(ValueError):
+        hide(b"x", "pw", "cover", "bogus")
+
+
+def test_reveal_no_payload_raises():
+    with pytest.raises(ValueError, match="no hidden message"):
+        reveal("plain text with nothing hidden", "pw", "zw")
+    with pytest.raises(ValueError, match="no hidden message"):
+        reveal("plain text\nwith nothing", "pw", "ws")
+
+
+# ---------------------------------------------------------------------------
+# CLI smoke tests: drive the actual main() function with argv
+# ---------------------------------------------------------------------------
+
+import io
+import tempfile
+import os
+from steg import main
+
+
+def _run_cli(argv, stdin_text=None):
+    """Call main(argv) with patched stdin/stdout. Returns (rc, stdout, stderr)."""
+    old_stdin, old_stdout, old_stderr = sys.stdin, sys.stdout, sys.stderr
+    sys.stdin = io.StringIO(stdin_text or "")
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    try:
+        rc = main(argv)
+        return rc, sys.stdout.getvalue(), sys.stderr.getvalue()
+    finally:
+        sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
+
+
+def test_cli_encode_decode_zw_via_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.txt")
+        stego_path = os.path.join(tmp, "stego.txt")
+        with open(cover_path, "w", encoding="utf-8") as f:
+            f.write("a normal cover sentence here ok")
+        rc, _, err = _run_cli([
+            "encode", "-m", "zw", "-p", "mypw",
+            "-s", "top secret payload",
+            "-c", cover_path, "-o", stego_path,
+        ])
+        assert rc == 0, f"encode failed: {err}"
+        with open(stego_path, "r", encoding="utf-8") as f:
+            stego_text = f.read()
+        rc, out, err = _run_cli([
+            "decode", "-m", "zw", "-p", "mypw",
+            "-i", stego_path,
+        ])
+        assert rc == 0, f"decode failed: {err}"
+        assert out == "top secret payload"
+
+
+def test_cli_encode_decode_ws_via_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.txt")
+        stego_path = os.path.join(tmp, "stego.txt")
+        with open(cover_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(f"line number {i}" for i in range(300)))
+        rc, _, err = _run_cli([
+            "encode", "-m", "ws", "-p", "mypw",
+            "-s", "top secret payload",
+            "-c", cover_path, "-o", stego_path,
+        ])
+        assert rc == 0, f"encode failed: {err}"
+        rc, out, err = _run_cli([
+            "decode", "-m", "ws", "-p", "mypw",
+            "-i", stego_path,
+        ])
+        assert rc == 0, f"decode failed: {err}"
+        assert out == "top secret payload"
+
+
+def test_cli_decode_wrong_password_returns_nonzero():
+    with tempfile.TemporaryDirectory() as tmp:
+        stego_path = os.path.join(tmp, "stego.txt")
+        rc, _, err = _run_cli([
+            "encode", "-m", "zw", "-p", "right",
+            "-s", "secret",
+            "-c", "-", "-o", stego_path,
+        ], stdin_text="cover text")
+        assert rc == 0
+        rc, out, err = _run_cli([
+            "decode", "-m", "zw", "-p", "wrong",
+            "-i", stego_path,
+        ])
+        assert rc == 3
+        assert "wrong password" in err or "corrupted" in err
+
+
+def test_cli_decode_no_payload_returns_nonzero():
+    rc, out, err = _run_cli([
+        "decode", "-m", "zw", "-p", "pw",
+        "-i", "-",
+    ], stdin_text="just plain text, nothing hidden")
+    assert rc == 2
+    assert "no hidden" in err
+
+
+def test_cli_encode_cover_with_tab_errors():
+    rc, out, err = _run_cli([
+        "encode", "-m", "ws", "-p", "pw",
+        "-s", "secret",
+        "-c", "-", "-o", "-",
+    ], stdin_text="line with\ttab inside")
+    assert rc == 2
+    assert "tab" in err or "trailing" in err
+
+
+def test_cli_unknown_method_rejected():
+    with pytest.raises(SystemExit):
+        _run_cli([
+            "encode", "-m", "bogus", "-p", "pw", "-s", "x", "-c", "-", "-o", "-",
+        ], stdin_text="cover")
 
 
