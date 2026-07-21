@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Whitespace steganography — how it works · text-steganography</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="top">
+  <span class="brand">text-steganography</span>
+  <a href="index.html">demo</a>
+  <a href="whitespace.html" class="active">whitespace · how it works</a>
+  <a href="zero-width.html">zero-width · how it works</a>
+</nav>
+<main>
+  <header>
+    <h1>Whitespace steganography, explained from zero</h1>
+    <div class="subtitle">
+      The trailing space/tab method (SNOW-style). We hide an encrypted secret
+      in the invisible whitespace at the end of text lines. This page walks one
+      tiny payload through every single step, including what it looks like on
+      paper and exactly where it breaks.
+    </div>
+  </header>
+
+  <h2>1. The one-sentence idea</h2>
+  <p>
+    A byte is 8 bits. Each bit is either 0 or 1. A line of text can quietly
+    carry one bit by ending in an ordinary space (means 0) or a tab character
+    (means 1). Stack enough lines and you can hide any message as invisible
+    trailing whitespace — no strange characters, no colors, nothing the eye
+    notices.
+  </p>
+
+  <h2>2. The cast of characters</h2>
+  <table>
+    <tr><th>Thing</th><th>What it is</th><th>Role in the trick</th></tr>
+    <tr><td><code>secret</code></td><td>the message you actually want to send</td><td>encrypted first, then hidden</td></tr>
+    <tr><td><code>password</code></td><td>a string only you and the recipient know</td><td>turns the secret into unreadable ciphertext</td></tr>
+    <tr><td><code>cover</code></td><td>innocent-looking text everyone sees</td><td>camouflage; payload is added to its line ends</td></tr>
+    <tr><td><code>stego text</code></td><td>the cover with hidden bits appended</td><td>what you actually send</td></tr>
+    <tr><td><code>space</code> <span class="kbd">␣</span></td><td>ASCII 0x20, the normal space</td><td>encodes a 0 bit</td></tr>
+    <tr><td><code>tab</code> <span class="kbd">\t</span></td><td>ASCII 0x09</td><td>encodes a 1 bit</td></tr>
+  </table>
+
+  <h2>3. The full pipeline (end to end)</h2>
+  <ol class="steps">
+    <li><strong>Encrypt.</strong> The secret's UTF-8 bytes go through <code>Fernet</code> (AES-128-CBC + HMAC-SHA256) keyed by SHA-256(password). Out comes <code>ciphertext</code> — random-looking bytes. Even if someone later finds the hidden bits, they still need the password.</li>
+    <li><strong>Length-prefix.</strong> Prepend the ciphertext length as a 4-byte big-endian integer. This is the header that lets the decoder know when to stop reading bits.</li>
+    <li><strong>Bits.</strong> Convert <code>[4-byte length] + ciphertext</code> to one long binary string. Every byte becomes 8 characters of <code>0</code>/<code>1</code>.</li>
+    <li><strong>Append.</strong> Split the cover by <code>\n</code>. For each bit in order, take the next line and append a <code>␣</code> (bit 0) or <code>\t</code> (bit 1) to its end. If the cover runs out of lines, pad with empty lines (each empty line still gets one trailing space/tab — see Limitations).</li>
+    <li><strong>Send.</strong> The receiver gets text that looks normal. They do not need any special software beyond something that preserves trailing whitespace.</li>
+    <li><strong>Decode.</strong> For every line, walk backwards from the end: space→0, tab→1, stop at the first non-whitespace char. Concatenate the bits.</li>
+    <li><strong>Read header.</strong> First 32 bits = length in bytes. Read that many more bytes as the ciphertext.</li>
+    <li><strong>Decrypt.</strong> Feed ciphertext + password back through Fernet. Out comes the original secret. Wrong password → Fernet's HMAC rejects it, you get nothing.</li>
+  </ol>
+
+  <h2>4. The worked example, on paper</h2>
+  <p>
+    Let's hide the 1-byte secret <code>'A'</code> (= 0x41) in this 3-line cover
+    using password <code>"pw"</code>. We'll do every step by hand so you can
+    see the bits.
+  </p>
+
+  <h3>Step A — encrypt</h3>
+  <p>
+    <code>encrypt_message(b"A", "pw")</code> asks Fernet for ciphertext. Fernet
+    adds a random IV, so the real bytes are unpredictable; for this walkthrough
+    pretend the ciphertext comes out to exactly one byte:
+  </p>
+<pre><code>ciphertext = b"\x41"      # 1 byte, value 0100 0001
+</code></pre>
+  <p class="note info">In real use Fernet's output is much longer (it prepends a version byte, timestamp, IV, and appends an HMAC). The math is identical — just more bits. We use 1 byte here so the page fits.</p>
+
+  <h3>Step B — length-prefix</h3>
+  <p>The length of the ciphertext is 1. Encode 1 as a 4-byte big-endian integer, then concatenate the ciphertext:</p>
+<pre><code>length (4 bytes):  00 00 00 01
+ciphertext (1 byte): 41
+payload (5 bytes):  00 00 00 01 41
+</code></pre>
+
+  <h3>Step C — to bits</h3>
+  <p>Each byte → 8 bits. 5 bytes → 40 bits total:</p>
+<pre><code>00       00       00       01       41
+00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>So the full bit string we need to hide is:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+└────── header (32 bits) ────────┘└ payload ┘
+</code></pre>
+
+  <h3>Step D — append to cover lines</h3>
+  <p>Cover is 3 lines, payload is 40 bits → we need 40 lines, so the encoder pads with 37 empty lines. Bit 0 → space, bit 1 → tab. The first few lines become:</p>
+<div class="ascii">hello world<span class="ws0">␣</span>        <span class="dim"># bit 0  → trailing space</span>
+it is nice<span class="ws0">␣</span>         <span class="dim"># bit 0  → trailing space</span>
+today<span class="ws0">␣</span>              <span class="dim"># bit 0  → trailing space</span>
+<span class="ws0">␣</span>                   <span class="dim"># bit 0  (padded empty line)</span>
+<span class="ws0">␣</span>                   <span class="dim"># bit 0  (padded empty line)</span>
+...                  <span class="dim">...more zeros...</span>
+<span class="ws1">→|</span>                  <span class="dim"># bit 33 → the lone '1' (tab), this is the "00000001" byte</span>
+<span class="ws0">␣</span>                   <span class="dim"># bit 34</span>
+<span class="ws0">␣</span>                   <span class="dim"># bit 35</span>
+<span class="ws0">␣</span>                   <span class="dim"># bit 36</span>
+<span class="ws0">␣</span>                   <span class="dim"># bit 37</span>
+<span class="ws1">→|</span>                  <span class="dim"># bit 38 → '1' (the '01000001' byte's high bit)</span>
+<span class="ws0">␣</span>                   <span class="dim"># bit 39 → '0'</span>
+</div>
+  <p class="note warn"><strong>Notice the giveaway:</strong> the cover had 3 short lines, but the stego text now has 40 lines, most of them empty. That is the single biggest detection signal for this method and you cannot avoid it — see §6.</p>
+
+  <h3>Step E — decode (reverse)</h3>
+  <p>For each line, read backwards: tab=1, space=0, stop at non-whitespace. You get the same 40-bit string back:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>First 32 bits → <code>int(...,2) = 1</code>, so the decoder knows to read 1 more byte. The next 8 bits → <code>01000001 = 0x41 = b"A"</code>. Hand <code>b"\x41"</code> and <code>"pw"</code> to Fernet → original secret.</p>
+
+  <h2>5. Doing it yourself on paper</h2>
+  <ol>
+    <li>Pick a short secret and a short cover (a couple of sentences, one idea per line).</li>
+    <li>Write the secret's bytes in binary (an ASCII table is fine; for arbitrary bytes use Python: <code>' '.join(f'{b:08b}' for b in secret.encode())</code>).</li>
+    <li>Count the bits. Add 32 for the length header. That number = how many lines your cover needs. If your cover is shorter, the encoder invents blank lines — visible to a careful reader.</li>
+    <li>For each bit, append <code>␣</code> (0) or <code>\t</code> (1) to the next line. Use a text editor that shows whitespace (VS Code: toggle "Render Whitespace").</li>
+    <li>To decode: for each line strip the trailing whitespace, recording 0 for space and 1 for tab. First 32 bits → length, next <code>length×8</code> bits → ciphertext bytes.</li>
+  </ol>
+  <p class="note info">You can skip the paper and just use the <a href="index.html">demo</a> or the CLI: <code>echo "cover" | python steg.py encode -m ws -p pw -s "A" -o stego.txt</code> then <code>python steg.py decode -m ws -p pw -i stego.txt</code>.</p>
+
+  <h2>6. Where it fails</h2>
+  <div class="note danger">
+    <p><strong>Whitespace stripping.</strong> Most Markdown renderers, code formatters (Prettier, Black with <code>--trim-trailing-whitespace</code>), <code>git diff</code> with <code>-w</code>, and many chat apps delete trailing whitespace on save or render. If even one trailing space/tab is removed, the bit string shifts and decode fails (returns <code>b""</code>).</p>
+  </div>
+  <div class="note danger">
+    <p><strong>Line reflow.</strong> Re-wrapping text (word processors, Gmail compose) joins and splits lines. The bit-per-line assumption breaks. The payload is gone.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>Line-count blowup.</strong> Each payload bit eats one line. A 1 KB ciphertext needs <code>(4 + 1024) × 8 = 8224</code> lines. A short cover gets padded with thousands of empty lines — instantly suspicious.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>Existing tabs in the cover.</strong> A <code>\t</code> already inside a line would be misread as a 1-bit by the decoder (it walks backwards from the end and tabs are tabs from either side). The encoder refuses covers that contain any tab. Same for pre-existing trailing whitespace — the encoder rejects it to avoid ambiguity.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>HTML / rich text.</strong> Web pages collapse runs of whitespace and ignore trailing whitespace entirely. Pasting rendered HTML destroys the payload. Only transport as plain text.</p>
+  </div>
+
+  <h2>7. Is it safe?</h2>
+  <p>Two separate questions. People conflate them and that's where the mistakes happen.</p>
+
+  <h3>Can the hidden message be read?</h3>
+  <div class="note safe">
+    <p><strong>Yes, against the secret's <em>contents</em>: it is encrypted.</strong> Fernet is AES-128-CBC with HMAC-SHA256 authentication. The key is SHA-256(password). Even with the stego text and the password, the attacker still needs the password to decrypt. Wrong password → HMAC mismatch → Fernet throws <code>InvalidToken</code>, nothing leaks.</p>
+  </div>
+  <div class="note danger">
+    <p><strong>No, against the key.</strong> Key derivation is plain SHA-256 — no salt, no PBKDF2. An attacker who has the ciphertext can brute-force a weak password offline at full hash speed. The README marks this as a known simplification; if your threat model includes offline brute force, switch to <code>PBKDF2HMAC</code> with a random salt (and ship the salt — it can be public).</p>
+  </div>
+
+  <h3>Is the existence of the message hidden?</h3>
+  <div class="note danger">
+    <p><strong>No.</strong> Steganography hides content from humans, not from analysis. <code>python steg.py detect -m ws -i text.txt</code> counts trailing tabs; many lines ending in tabs is positive proof a payload exists. The detect command even reads the 4-byte length header and tells the attacker <em>exactly how many bytes are hidden</em>, no password required. The password protects the <em>contents</em>, not the <em>existence</em>.</p>
+  </div>
+
+  <h2>8. Limits (short version)</h2>
+  <ul>
+    <li><strong>Capacity.</strong> 1 bit per line. Headers and HMAC overhead mean even a 100-character secret needs a cover of hundreds of lines.</li>
+    <li><strong>Lossy transport is deadly.</strong> Anything that strips, rewraps, or HTML-renderes trailing whitespace kills the payload. Screenshots, OCR, TTS, paste-into-Word: all gone.</li>
+    <li><strong>Channel is suspicious.</strong> A normal person's text file does not have trailing tabs on half its lines. Detection is easy.</li>
+    <li><strong>No integrity without the password.</strong> A bit flip in transit corrupts the ciphertext; Fernet's HMAC catches it but you lose the whole message — no partial recovery.</li>
+    <li><strong>Cover must be tab-free and trailing-whitespace-free.</strong> The encoder rejects covers that violate this rather than silently mis-encoding.</li>
+  </ul>
+
+  <h2>9. When to pick this method</h2>
+  <p>
+    Pick whitespace when the channel <em>preserves trailing whitespace</em> but
+    <em>strips zero-width characters</em> — e.g. raw text files, plain-text
+    email, source-code comments, <code>git diff</code> without <code>-w</code>.
+    For everything else (HTML, chat apps, rendered Markdown) the
+    <a href="zero-width.html">zero-width method</a> usually survives better.
+  </p>
+
+  <footer>
+    MIT licensed. See the <a href="https://github.com/Saman-ghorayshi/text-steganography">source on GitHub</a>.
+    Part of the text-steganography teaching pages —
+    <a href="index.html">demo</a> ·
+    <a href="whitespace.html">whitespace</a> ·
+    <a href="zero-width.html">zero-width</a>.
+  </footer>
+</main>
+</body>
+</html>

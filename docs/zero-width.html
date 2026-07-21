@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Zero-width steganography — how it works · text-steganography</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="top">
+  <span class="brand">text-steganography</span>
+  <a href="index.html">demo</a>
+  <a href="whitespace.html">whitespace · how it works</a>
+  <a href="zero-width.html" class="active">zero-width · how it works</a>
+</nav>
+<main>
+  <header>
+    <h1>Zero-width Unicode steganography, explained from zero</h1>
+    <div class="subtitle">
+      We hide an encrypted secret in invisible Unicode characters inserted
+      into the cover text. The text looks identical to the eye. This page
+      walks one tiny payload through every single step, including what it
+      looks like on paper and exactly where it breaks.
+    </div>
+  </header>
+
+  <h2>1. The one-sentence idea</h2>
+  <p>
+    Some Unicode characters render with <em>zero width</em> — they exist in
+    the string but take no visible space. We use two of them as binary digits:
+    <code>U+200B</code> (zero-width space) means 0,
+    <code>U+200C</code> (zero-width non-joiner) means 1.
+    Insert enough of them into ordinary text and you can hide any message
+    without changing how the text looks.
+  </p>
+
+  <h2>2. The cast of characters</h2>
+  <table>
+    <tr><th>Thing</th><th>What it is</th><th>Role in the trick</th></tr>
+    <tr><td><code>secret</code></td><td>the message you actually want to send</td><td>encrypted first, then hidden</td></tr>
+    <tr><td><code>password</code></td><td>a string only you and the recipient know</td><td>turns the secret into unreadable ciphertext</td></tr>
+    <tr><td><code>cover</code></td><td>innocent-looking text everyone sees</td><td>camouflage; payload is inserted invisibly</td></tr>
+    <tr><td><code>stego text</code></td><td>the cover with hidden chars inserted</td><td>what you actually send</td></tr>
+    <tr><td><code>U+200B</code> <span class="label">ZWS</span></td><td>zero-width space</td><td>encodes a 0 bit</td></tr>
+    <tr><td><code>U+200C</code> <span class="label">ZWNJ</span></td><td>zero-width non-joiner</td><td>encodes a 1 bit</td></tr>
+  </table>
+  <p class="note info">You will sometimes see a third character, U+200D (zero-width joiner) mentioned. We deliberately do not use it — two characters are enough for binary and the decoder stays simpler. U+200D in cover text is ignored on decode, not stripped.</p>
+
+  <h2>3. The full pipeline (end to end)</h2>
+  <ol class="steps">
+    <li><strong>Encrypt.</strong> The secret's UTF-8 bytes go through <code>Fernet</code> (AES-128-CBC + HMAC-SHA256) keyed by SHA-256(password). Out comes random-looking <code>ciphertext</code>. Even if someone finds the hidden bits, the contents are still protected by the password.</li>
+    <li><strong>Length-prefix.</strong> Prepend the ciphertext length as a 4-byte big-endian integer. This is the header the decoder needs to know where the payload ends.</li>
+    <li><strong>Bits.</strong> Convert <code>[4-byte length] + ciphertext</code> to one binary string. Every byte → 8 chars of <code>0</code>/<code>1</code>.</li>
+    <li><strong>Insert.</strong> Map each bit to <code>U+200B</code> (0) or <code>U+200C</code> (1) and insert the whole block right after the first character of the cover. (The decoder ignores position — it reads <em>every</em> zero-width char in the text. Placement is cosmetic. See Limitations.)</li>
+    <li><strong>Send.</strong> The receiver gets text that displays byte-for-byte like the cover. To the eye it is unchanged.</li>
+    <li><strong>Decode.</strong> Scan the entire text. For each char that is <code>U+200B</code> or <code>U+200C</code>, append <code>0</code> or <code>1</code> to a bit string. Skip every other character.</li>
+    <li><strong>Read header.</strong> First 32 bits = length in bytes. Read that many more bytes as the ciphertext.</li>
+    <li><strong>Decrypt.</strong> Feed ciphertext + password to Fernet. Wrong password → HMAC rejects, nothing leaks.</li>
+  </ol>
+
+  <h2>4. The worked example, on paper</h2>
+  <p>
+    Hide the 1-byte secret <code>'A'</code> (0x41) in <code>"hello"</code> with
+    password <code>"pw"</code>. We'll do every step by hand.
+  </p>
+
+  <h3>Step A — encrypt</h3>
+  <p>
+    <code>encrypt_message(b"A", "pw")</code> produces Fernet ciphertext. Fernet
+    adds a random IV, so the real output is unpredictable; for this walkthrough
+    pretend the ciphertext comes out to exactly one byte:
+  </p>
+<pre><code>ciphertext = b"\x41"      # 1 byte, value 0100 0001
+</code></pre>
+  <p class="note info">In real use Fernet's output is much longer (version byte + timestamp + IV + ciphertext + HMAC tag). The math is identical — just more bits. We use 1 byte so the page fits.</p>
+
+  <h3>Step B — length-prefix</h3>
+<pre><code>length (4 bytes):  00 00 00 01
+ciphertext (1 byte): 41
+payload (5 bytes):  00 00 00 01 41
+</code></pre>
+
+  <h3>Step C — to bits</h3>
+<pre><code>00       00       00       01       41
+00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>The bit string we need to insert is:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+└────── header (32 bits) ────────┘└ payload ┘
+</code></pre>
+
+  <h3>Step D — map to zero-width characters and insert</h3>
+  <p>Each <code>0</code> → <code>U+200B</code>, each <code>1</code> → <code>U+200C</code>. That's 40 invisible characters. The encoder inserts the whole block right after the first character of <code>"hello"</code>:</p>
+<div class="ascii">h<span class="zw">​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌​‌</span>ello
+<span class="dim">  └───── 40 invisible chars (ZWS=0, ZWNJ=1) ─────┘</span>
+</div>
+  <p>
+    The invisible characters above are real — if your browser rendered this
+    page, the underlined span contains the actual payload. To the eye the line
+    still reads <code>hello</code>. Copy-paste it, open it in any text editor,
+    and it still reads <code>hello</code>. But a tool that counts zero-width
+    chars will find 40.
+  </p>
+  <p>The encoder also handles two edge cases you'd hit on paper:</p>
+  <ul>
+    <li><strong>Empty cover.</strong> If <code>cover == ""</code> the stego text is just the 40 invisible chars — a "message" that displays as nothing. Still decodes fine.</li>
+    <li><strong>Cover already has payload chars.</strong> If the cover already contains a <code>U+200B</code> or <code>U+200C</code> the encoder refuses — otherwise the decode count would be wrong. Encoder raises <code>ValueError</code>.</li>
+  </ul>
+
+  <h3>Step E — decode (reverse)</h3>
+  <p>Scan the whole text. For each character, check: is it <code>U+200B</code>? Append <code>0</code>. Is it <code>U+200C</code>? Append <code>1</code>. Otherwise skip. We get the 40-bit string back:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>First 32 bits <code>→ 1</code> (length). Next 8 bits <code>→ 0x41</code> (<code>b"A"</code>). Hand bytes + password to Fernet → original secret.</p>
+
+  <h2>5. Doing it yourself on paper</h2>
+  <ol>
+    <li>Pick a short secret and any cover (one word is enough — the cover barely matters for capacity here).</li>
+    <li>Write the secret's bytes in binary. For arbitrary bytes: <code>' '.join(f'{b:08b}' for b in secret.encode())</code>.</li>
+    <li>Prepend 32 zero-bits (placeholder for the length — you'll fill in the real length at the end). Total bits needed = 32 + 8 × (number of ciphertext bytes).</li>
+    <li>For each bit write <code>U+200B</code> (0) or <code>U+200C</code> (1). Type them with <code>\u200b</code> and <code>\u200c</code> in Python, or copy from a Unicode picker.</li>
+    <li>Insert the whole block after the first character of your cover. (Anywhere works — decode ignores position. Placement only matters for steganalysis resistance.)</li>
+    <li>To decode: programmatically count/filter the two char classes in the text. Doing this by hand is impractical, which is the point — the eye can't see the payload.</li>
+  </ol>
+  <p class="note info">Skip the paper and use the <a href="index.html">demo</a> or CLI: <code>echo "hello" | python steg.py encode -m zw -p pw -s "A" -o stego.txt</code> then <code>python steg.py decode -m zw -p pw -i stego.txt</code>.</p>
+
+  <h2>6. Where it fails</h2>
+  <div class="note danger">
+    <p><strong>Sanitizing platforms.</strong> WhatsApp, Discord, Telegram in some modes, GitLab rendered Markdown, and most rich-text email clients strip <code>U+200B</code>/<code>U+200C</code> on paste or render. The payload is silently deleted. <em>Test your channel before trusting it.</em></p>
+  </div>
+  <div class="note danger">
+    <p><strong>Encoding round-trips.</strong> If text gets re-encoded through a system that drops "format" or "invisible" Unicode categories (some legacy pipelines, ASCII-only transports), the characters vanish. Any byte lost means the length header no longer matches and decode returns <code>b""</code>.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>The cluster is detectable.</strong> This tool inserts all the invisible chars as one block right after the first character. A steganalyst scanning the byte offsets of <code>U+200B</code>/<code>U+200C</code> sees a giant spike at position 1 — proof of a payload and a hint it's this tool. Distributing the chars evenly across the cover would help; the code marks this as a known simplification. See <code>zw_encode</code> in <code>steg.py</code>.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>Cover validators occasionally reject zero-width chars.</strong> Some forms (passwords, usernames, payment fields) treat zero-width chars as suspicious and reject the whole string. Don't try to hide a payload inside a username.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>Lossy visual transport.</strong> Screenshots, OCR, text-to-speech, and printed paper all drop the invisible chars. The payload only survives digital copy-paste that preserves Unicode.</p>
+  </div>
+
+  <h2>7. Is it safe?</h2>
+  <p>Two separate questions. People conflate them and that's where the mistakes happen.</p>
+
+  <h3>Can the hidden message be read?</h3>
+  <div class="note safe">
+    <p><strong>Against the secret's <em>contents</em>: yes, it is encrypted.</strong> Fernet is AES-128-CBC + HMAC-SHA256. The key is SHA-256(password). Even given the stego text and the password, the attacker still needs the password to decrypt. Wrong password → HMAC mismatch → Fernet throws <code>InvalidToken</code>, nothing leaks.</p>
+  </div>
+  <div class="note danger">
+    <p><strong>Against the key: no.</strong> Key derivation is plain SHA-256 — no salt, no PBKDF2. An attacker with the ciphertext can brute-force a weak password offline at full hash speed. Marked as a known simplification in the README; upgrade to <code>PBKDF2HMAC</code> + random salt if offline brute-force is part of the threat model.</p>
+  </div>
+
+  <h3>Is the existence of the message hidden?</h3>
+  <div class="note danger">
+    <p><strong>No — and worse than the whitespace method here.</strong> <code>U+200B</code> and <code>U+200C</code> essentially never appear in normal prose. <em>Any</em> count above zero is positive evidence of a payload. <code>python steg.py detect -m zw -i text.txt</code> counts the invisible chars, divides by 8 for the hidden byte count, and reads the 4-byte length header to say exactly how many bytes are hidden — all without the password. Steganography hides content from humans, not from analysis tools.</p>
+  </div>
+
+  <h2>8. Limits (short version)</h2>
+  <ul>
+    <li><strong>Capacity.</strong> Practically unlimited — cover length barely matters because the invisible chars take no visible space. But the more you insert, the bigger the cluster and the more detectable the payload becomes.</li>
+    <li><strong>Sensitive to transport.</strong> Any platform that sanitizes invisible Unicode kills the payload. There is no graceful degradation — one stripped char means the length header is wrong means decode fails entirely.</li>
+    <li><strong>Trivially detectable.</strong> A character class count is enough. Zero resistance to statistical steganalysis.</li>
+    <li><strong>Clustered placement.</strong> All payload chars sit after the cover's first character in this implementation. Better resistance would distribute them; the decoder doesn't care where they live so this is a one-function change.</li>
+    <li><strong>No integrity without the password.</strong> A bit flip in transit corrupts the ciphertext; Fernet's HMAC catches it but you lose the whole message.</li>
+    <li><strong>Cover must not already contain U+200B/U+200C.</strong> The encoder rejects such covers rather than silently double-counting.</li>
+  </ul>
+
+  <h2>9. When to pick this method</h2>
+  <p>
+    Pick zero-width when the channel preserves Unicode <em>and</em> strips
+    trailing whitespace — rendered text in most chat apps, web pages, raw paste
+    boxes. Pick <a href="whitespace.html">whitespace</a> when the opposite is
+    true (raw files, source code, plain-text email). They fail in opposite
+    conditions, which is why this tool ships both.
+  </p>
+
+  <footer>
+    MIT licensed. See the <a href="https://github.com/Saman-ghorayshi/text-steganography">source on GitHub</a>.
+    Part of the text-steganography teaching pages —
+    <a href="index.html">demo</a> ·
+    <a href="whitespace.html">whitespace</a> ·
+    <a href="zero-width.html">zero-width</a>.
+  </footer>
+</main>
+</body>
+</html>
