@@ -295,6 +295,144 @@ def img_decode(stego_png: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Method: audio (WAV 16-bit LSB)
+# Each payload bit goes into the LSB of a 16-bit signed PCM sample. One bit
+# per channel sample, walked in frame order, channels in order. Only 16-bit
+# signed PCM is supported: 8-bit unsigned, 24/32-bit float or compressed
+# WAVs (ADPCM, A-law) would mangle the payload. Pillow-style soft import
+# is not needed because wave + struct are stdlib.
+# ponytail: a real lossless-only codec panel (FLAC, ALAC) is academic; WAV
+# 16-bit PCM is the only uncompressed portable format Python ships a reader
+# for. Add wider format support when a real cover track in another format
+# is actually supplied by someone.
+# ---------------------------------------------------------------------------
+
+def wav_capacity(nframes: int, nchannels: int) -> int:
+    """Bytes of ciphertext a 16-bit PCM WAV can hide via sample-LSB.
+
+    One bit per 16-bit sample, one sample per channel per frame. Capacity =
+    (nframes * nchannels) bits // 8, minus the 4-byte length header.
+    Raises ValueError on non-positive dims, TypeError on non-int (or bool) input.
+    """
+    if not isinstance(nframes, int) or isinstance(nframes, bool):
+        raise TypeError("nframes must be int")
+    if not isinstance(nchannels, int) or isinstance(nchannels, bool):
+        raise TypeError("nchannels must be int")
+    if nframes <= 0 or nchannels <= 0:
+        raise ValueError(
+            f"nframes and nchannels must be positive, got {nframes}/{nchannels}"
+        )
+    return (nframes * nchannels) // 8 - 4
+
+
+def _wav_open(cover_bytes: bytes):
+    """Open a WAV from bytes with the stdlib wave module. Raises ValueError
+    on anything wave can't read (truncated, bad header, not a WAV at all).
+    Returns the wave.Wave_read object so the caller can pull params + frames.
+    """
+    import io as _io
+    import wave as _wave
+    if not isinstance(cover_bytes, (bytes, bytearray)):
+        raise TypeError("wav input must be bytes")
+    try:
+        return _wave.open(_io.BytesIO(cover_bytes), "rb")
+    except _wave.Error as e:
+        raise ValueError(f"not a readable WAV: {e}") from e
+
+
+def wav_encode(data: bytes, cover_wav: bytes) -> bytes:
+    """Hide `data` in the LSBs of a 16-bit signed PCM WAV. Returns new WAV bytes.
+
+    One payload bit per 16-bit sample, walked in frame order, channels in
+    order (L then R per frame for stereo). Refuses anything that isn't
+    16-bit PCM (`sampwidth != 2`) because 8-bit is unsigned and the LSB math
+    differs, and 24/32-bit float or compressed WAVs would mangle the payload.
+    Raises ValueError if the cover is too small or `cover_wav` is not a WAV.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    w = _wav_open(cover_wav)
+    nchannels = w.getnchannels()
+    nframes = w.getnframes()
+    sampwidth = w.getsampwidth()
+    if sampwidth != 2:
+        raise ValueError(
+            f"only 16-bit signed PCM WAV supported (sampwidth=2), got sampwidth={sampwidth}"
+        )
+    capacity = wav_capacity(nframes, nchannels)
+    payload = _length_prefix(data)
+    if len(payload) > capacity:
+        raise ValueError(
+            f"cover too small: need {len(payload)} bytes of LSB capacity, "
+            f"have {capacity}"
+        )
+    framerate = w.getframerate()
+    frames = bytearray(w.readframes(nframes))
+    w.close()
+    # total 16-bit samples = len(frames) // 2 (sampwidth=2)
+    n_samples = len(frames) // 2
+    bits = _bytes_to_bits(payload)
+    import struct as _struct
+    # walk samples in order; write one payload bit into each sample's LSB
+    for i in range(n_samples):
+        if i >= len(bits):
+            break
+        offset = i * 2
+        # unpack as UNSIGNED to avoid Python's arbitrary-precision &
+        # turning negative signed samples into huge positive ints.
+        u = _struct.unpack_from("<H", frames, offset)[0]
+        u = (u & 0xFFFE) | (1 if bits[i] == "1" else 0)
+        _struct.pack_into("<H", frames, offset, u)
+    # rebuild the WAV with identical params + modified frames
+    import io as _io
+    import wave as _wave
+    out = _io.BytesIO()
+    with _wave.open(out, "wb") as wo:
+        wo.setnchannels(nchannels)
+        wo.setsampwidth(sampwidth)
+        wo.setframerate(framerate)
+        wo.writeframes(bytes(frames))
+    return out.getvalue()
+
+
+def wav_decode(stego_wav: bytes) -> bytes:
+    """Recover the payload hidden by wav_encode. Returns the bytes (empty on
+    a malformed/empty payload so callers can signal 'no hidden message').
+    Raises ValueError if the input is not a readable WAV.
+    """
+    if not isinstance(stego_wav, (bytes, bytearray)):
+        raise TypeError("stego_wav must be bytes")
+    w = _wav_open(stego_wav)
+    sampwidth = w.getsampwidth()
+    if sampwidth != 2:
+        w.close()
+        raise ValueError(
+            f"only 16-bit signed PCM WAV supported (sampwidth=2), got sampwidth={sampwidth}"
+        )
+    nframes = w.getnframes()
+    frames = w.readframes(nframes)
+    w.close()
+    n_samples = len(frames) // 2
+    import struct as _struct
+    bits = []
+    for i in range(n_samples):
+        offset = i * 2
+        # unsigned read — the LSB of the 16-bit value is the payload bit
+        u = _struct.unpack_from("<H", frames, offset)[0]
+        bits.append("1" if (u & 1) else "0")
+    bitstr = "".join(bits)
+    if len(bitstr) < 32:
+        return b""
+    declared = int(bitstr[:32], 2)
+    if declared == 0:
+        return b""
+    needed = 32 + declared * 8
+    if needed > len(bitstr):
+        return b""  # truncated / corrupted
+    return _bits_to_bytes(bitstr[32:needed])
+
+
+# ---------------------------------------------------------------------------
 # Steganalysis helper: detect payload + read declared length WITHOUT password.
 # Demonstrates the boundary: steganography hides content, not existence.
 # Uses the same bit readers as the encoders; payload chars survive identifying.
@@ -382,6 +520,90 @@ def _analyze_img(png_bytes) -> dict:
     return base
 
 
+def _analyze_wav(wav_bytes) -> dict:
+    """Steganalysis on a 16-bit PCM WAV: read sample-LSB length header and
+    report the sample-LSB distribution. No password. 'suspicious' mirrors
+    the img contract: a readable non-zero declared length that fits inside
+    the WAV's sample LSB capacity is itself the steganographic signal —
+    random LSB noise would not produce such a tight prefix. Real portfolios
+    want a chi-square steganalyzer; this is the honest minimum.
+    """
+    if not isinstance(wav_bytes, (bytes, bytearray)):
+        raise TypeError("wav analyze input must be bytes")
+    if not isinstance(wav_bytes, bytes):
+        wav_bytes = bytes(wav_bytes)
+
+    w = _wav_open(wav_bytes)
+    if w.getsampwidth() != 2:
+        w.close()
+        raise ValueError(
+            f"only 16-bit signed PCM WAV supported (sampwidth=2), "
+            f"got sampwidth={w.getsampwidth()}"
+        )
+    nframes = w.getnframes()
+    nchannels = w.getnchannels()
+    frames = w.readframes(nframes)
+    w.close()
+
+    total_samples = len(frames) // 2
+    import struct as _struct
+    ones = 0
+    bits = []
+    for i in range(total_samples):
+        offset = i * 2
+        u = _struct.unpack_from("<H", frames, offset)[0]
+        b = u & 1
+        bits.append("1" if b else "0")
+        if b:
+            ones += 1
+    zeros = total_samples - ones
+    pct_ones = ones / total_samples if total_samples else 0.0
+    bitstr = "".join(bits)
+
+    base = {
+        "method": "wav",
+        "sample_lsb_distribution": {
+            "total_samples": total_samples,
+            "ones": ones,
+            "zeros": zeros,
+            "pct_ones": round(pct_ones, 4),
+        },
+        "declared_length": None,
+        "header_corrupted": False,
+        "suspicious": False,
+        "reason": None,
+        # mirror the keys generic _print_analysis can render
+        "payload_chars": total_samples,
+        "payload_byte_count": total_samples // 8,
+    }
+
+    if len(bitstr) < 32:
+        return base
+    declared = int(bitstr[:32], 2)
+    total_bytes = (total_samples - 32) // 8
+    if declared == 0:
+        base["declared_length"] = None
+        return base
+    declared_fits = declared * 8 + 32 <= total_samples
+    if not declared_fits:
+        base["declared_length"] = declared
+        base["header_corrupted"] = True
+        base["suspicious"] = True
+        base["reason"] = (
+            f"declared {declared} bytes but WAV only stores "
+            f"{total_bytes} sample-LSB bytes"
+        )
+        return base
+    base["declared_length"] = declared
+    base["suspicious"] = True
+    base["reason"] = (
+        f"sample-LSB stream contains a readable length header declaring "
+        f"{declared} bytes of payload that fits the WAV capacity "
+        f"({total_bytes} sample-LSB bytes) — random LSB noise would not"
+    )
+    return base
+
+
 def analyze(text, method: str) -> dict:
     """Report on whether `text` carries a hidden payload via `method`.
 
@@ -401,13 +623,19 @@ def analyze(text, method: str) -> dict:
                            (readable non-zero declared length that fits the
                            image is, itself, the steganographic signal)
       reason             - str when suspicious is True, else None
+    For method == 'wav' adds:
+      sample_lsb_distribution - dict {total_samples, ones, zeros, pct_ones}
+      suspicious         - bool: did the sample-LSB stream look structured?
+      reason             - str when suspicious is True, else None
     No password required. Does not decrypt.
     """
-    if method not in ("ws", "zw", "img"):
+    if method not in ("ws", "zw", "img", "wav"):
         raise ValueError(f"unknown method: {method!r}")
 
     if method == "img":
         return _analyze_img(text)
+    if method == "wav":
+        return _analyze_wav(text)
 
     if not isinstance(text, str):
         raise TypeError("text must be str")
@@ -492,6 +720,21 @@ def reveal_img(stego_png: bytes, password: str) -> bytes:
     return decrypt_message(ct, password)
 
 
+# Audio variants: cover and stego are bytes (WAV file bytes), not str.
+def hide_wav(secret: bytes, password: str, cover_wav: bytes) -> bytes:
+    """Encrypt then hide in a 16-bit PCM WAV cover. Returns stego WAV bytes."""
+    ct = encrypt_message(secret, password)
+    return wav_encode(ct, cover_wav)
+
+
+def reveal_wav(stego_wav: bytes, password: str) -> bytes:
+    """Decode an LSB-WAV payload then decrypt. Raises if stego carries nothing."""
+    ct = wav_decode(stego_wav)
+    if not ct:
+        raise ValueError("no hidden message found in input")
+    return decrypt_message(ct, password)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -544,6 +787,19 @@ def _png_only(path: str) -> None:
         )
 
 
+def _wav_only(path: str) -> None:
+    """Refuse any non-WAV output extension for the audio method. MP3, AAC,
+    OGG, and FLAC-conversion would re-encode lossy (or re-pack) and destroy
+    the sample LSB payload — mirrors _png_only.
+    """
+    lower = path.lower()
+    if lower != "-" and not (lower.endswith(".wav") or os.path.basename(lower) == ""):
+        raise ValueError(
+            f"refusing non-WAV output {path!r}: lossy encoders (MP3, AAC, OGG) "
+            "would destroy the sample-LSB payload"
+        )
+
+
 def _print_analysis(result: dict, json_output: bool) -> None:
     """Human (default) or JSON line for the analyze() result."""
     if json_output:
@@ -551,6 +807,9 @@ def _print_analysis(result: dict, json_output: bool) -> None:
         return
     if result["method"] == "img":
         _print_analysis_img(result)
+        return
+    if result["method"] == "wav":
+        _print_analysis_wav(result)
         return
     if result["payload_chars"] == 0:
         print(f"[{result['method']}] no payload characters found")
@@ -587,6 +846,25 @@ def _print_analysis_img(result: dict) -> None:
         print(f"[img] reason: {result['reason']}")
 
 
+def _print_analysis_wav(result: dict) -> None:
+    """Human render of a wav analyze() result."""
+    d = result["sample_lsb_distribution"]
+    print(f"[wav] {d['total_samples']} sample LSB bits "
+          f"({d['ones']} ones / {d['zeros']} zeros, "
+          f"{d['pct_ones']*100:.2f}% ones)")
+    if result["declared_length"] is None:
+        if not result["suspicious"]:
+            print("[wav] no readable length header in sample LSB stream")
+        return
+    declared = result["declared_length"]
+    note = " (header looks corrupted: declared length exceeds sample-LSB capacity)" \
+        if result["header_corrupted"] else ""
+    flag = "SUSPICIOUS" if result["suspicious"] else "ok"
+    print(f"[wav] declared {declared} bytes payload{note} — {flag}")
+    if result["reason"]:
+        print(f"[wav] reason: {result['reason']}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="steg",
@@ -596,10 +874,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     enc = sub.add_parser("encode", help="hide a secret message in cover text")
-    enc.add_argument("-m", "--method", choices=["ws", "zw", "img"], required=True,
+    enc.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav"], required=True,
                       help="ws = whitespace (space/tab at end of lines), "
                            "zw = zero-width Unicode chars, "
-                           "img = PNG LSB in pixel channel bytes")
+                           "img = PNG LSB in pixel channel bytes, "
+                           "wav = 16-bit PCM WAV sample LSB")
     enc.add_argument("-p", "--password", required=True, help="encryption password")
     enc.add_argument("-s", "--secret", required=True, help="secret message text to hide")
     enc.add_argument("-c", "--cover", default="-",
@@ -610,8 +889,9 @@ def _build_parser() -> argparse.ArgumentParser:
                            "For -m img, must end in .png; lossy formats are refused.")
 
     dec = sub.add_parser("decode", help="extract a secret message from stego text")
-    dec.add_argument("-m", "--method", choices=["ws", "zw", "img"], required=True,
-                      help="ws = whitespace, zw = zero-width, img = PNG LSB")
+    dec.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav"], required=True,
+                      help="ws = whitespace, zw = zero-width, img = PNG LSB, "
+                           "wav = 16-bit PCM WAV sample LSB")
     dec.add_argument("-p", "--password", required=True, help="decryption password")
     dec.add_argument("-i", "--input", default="-",
                      help="input stego text or, for -m img, stego PNG path "
@@ -627,8 +907,9 @@ def _build_parser() -> argparse.ArgumentParser:
     det = sub.add_parser("detect",
                          help="steganalysis: detect hidden payload WITHOUT the "
                               "password. Reads the declared length header.")
-    det.add_argument("-m", "--method", choices=["ws", "zw", "img"], required=True,
-                      help="ws = whitespace, zw = zero-width, img = PNG LSB")
+    det.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav"], required=True,
+                      help="ws = whitespace, zw = zero-width, img = PNG LSB, "
+                           "wav = 16-bit PCM WAV sample LSB")
     det.add_argument("-i", "--input", default="-",
                      help="input text to analyze (default: stdin)")
     det.add_argument("--json", action="store_true",
@@ -647,6 +928,11 @@ def main(argv=None) -> int:
                 cover = _read_bytes(args.cover)
                 stego = hide_img(args.secret.encode("utf-8"), args.password, cover)
                 _write_bytes(args.output, stego)
+            elif args.method == "wav":
+                _wav_only(args.output)
+                cover = _read_bytes(args.cover)
+                stego = hide_wav(args.secret.encode("utf-8"), args.password, cover)
+                _write_bytes(args.output, stego)
             else:
                 cover = _read_text(args.cover)
                 stego = hide(args.secret.encode("utf-8"), args.password, cover, args.method)
@@ -657,10 +943,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "decode":
-        if args.method == "img" and args.analyze:
+        if args.method in ("img", "wav") and args.analyze:
             try:
-                png = _read_bytes(args.input)
-                result = analyze(png, "img")
+                data = _read_bytes(args.input)
+                result = analyze(data, args.method)
             except (ValueError, TypeError, ImportError) as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 2
@@ -674,6 +960,22 @@ def main(argv=None) -> int:
                 return 2
             try:
                 secret = reveal_img(stego, args.password)
+            except ValueError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            except InvalidToken:
+                print("error: wrong password or corrupted payload", file=sys.stderr)
+                return 3
+            _write_text(args.output, secret.decode("utf-8"))
+            return 0
+        if args.method == "wav":
+            try:
+                stego = _read_bytes(args.input)
+            except OSError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            try:
+                secret = reveal_wav(stego, args.password)
             except ValueError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 2
@@ -707,7 +1009,10 @@ def main(argv=None) -> int:
 
     if args.command == "detect":
         try:
-            data = _read_bytes(args.input) if args.method == "img" else _read_text(args.input)
+            if args.method in ("img", "wav"):
+                data = _read_bytes(args.input)
+            else:
+                data = _read_text(args.input)
             result = analyze(data, args.method)
         except (ValueError, TypeError, ImportError) as e:
             print(f"error: {e}", file=sys.stderr)
