@@ -175,6 +175,68 @@ def zw_decode(text: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Steganalysis helper: detect payload + read declared length WITHOUT password.
+# Demonstrates the boundary: steganography hides content, not existence.
+# Uses the same bit readers as the encoders; payload chars survive identifying.
+# ---------------------------------------------------------------------------
+
+
+def analyze(text: str, method: str) -> dict:
+    """Report on whether `text` carries a hidden payload via `method`.
+
+    Returns a dict with keys:
+      method              - the method passed in
+      payload_chars      - how many payload characters were found
+      payload_byte_count - floor(payload_chars / 8), what would be decoded
+      declared_length     - length read from the 4-byte header (int or None)
+      header_corrupted    - bool: header bits were present but produced a
+                            length that exceeds the available payload bytes
+    No password required. Does not decrypt.
+    """
+    if method not in ("ws", "zw"):
+        raise ValueError(f"unknown method: {method!r}")
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+
+    if method == "zw":
+        bits = "".join(_ZW_CHAR_TO_BIT[ch] for ch in text if ch in _PAYLOAD_ZW_CHARS)
+    else:  # ws
+        bits = ""
+        for line in text.split("\n"):
+            trailing = ""
+            for ch in reversed(line):
+                if ch == " ":
+                    trailing = "0" + trailing
+                elif ch == "\t":
+                    trailing = "1" + trailing
+                else:
+                    break
+            bits += trailing
+
+    payload_chars = len(bits)
+    payload_byte_count = payload_chars // 8
+
+    if payload_chars < 32:
+        return {
+            "method": method,
+            "payload_chars": payload_chars,
+            "payload_byte_count": payload_byte_count,
+            "declared_length": None,
+            "header_corrupted": False,
+        }
+
+    declared = int(bits[:32], 2)
+    header_corrupted = declared * 8 > (payload_chars - 32)
+    return {
+        "method": method,
+        "payload_chars": payload_chars,
+        "payload_byte_count": payload_byte_count,
+        "declared_length": declared,
+        "header_corrupted": header_corrupted,
+    }
+
+
+# ---------------------------------------------------------------------------
 # High-level convenience wrappers (encrypt+encode, decode+decrypt in one call)
 # ---------------------------------------------------------------------------
 

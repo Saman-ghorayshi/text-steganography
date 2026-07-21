@@ -471,3 +471,75 @@ def test_cli_unknown_method_rejected():
         ], stdin_text="cover")
 
 
+# ---------------------------------------------------------------------------
+# analyze() steganalysis helper
+# ---------------------------------------------------------------------------
+
+from steg import analyze
+
+
+def test_analyze_empty_text_returns_none_length():
+    result = analyze("", "zw")
+    assert result["payload_chars"] == 0
+    assert result["declared_length"] is None
+    assert result["header_corrupted"] is False
+
+
+def test_analyze_plain_text_no_payload():
+    # text without zw chars or trailing whitespace
+    result = analyze("the quick brown fox\njumps over the lazy dog", "zw")
+    assert result["payload_chars"] == 0
+    assert result["declared_length"] is None
+    result = analyze("the quick brown fox\njumps over the lazy dog", "ws")
+    assert result["payload_chars"] == 0
+    assert result["declared_length"] is None
+
+
+def test_analyze_zw_after_real_encode_reads_declared_length():
+    # round-trip a known payload, verify analyze reads its length WITHOUT password
+    secret = b"a known payload"  # 15 bytes
+    ct = encrypt_message(secret, "pw")
+    stego = zw_encode(ct, "plain cover")
+    result = analyze(stego, "zw")
+    assert result["payload_chars"] > 0
+    assert result["declared_length"] == len(ct)  # reads header without password
+    assert not result["header_corrupted"]
+    # we know the ciphertext size but NOT the plaintext size from analyze alone
+    assert result["declared_length"] != len(secret)
+
+
+def test_analyze_ws_after_real_encode_reads_declared_length():
+    secret = b"ws method twelve"  # 16 bytes
+    ct = encrypt_message(secret, "pw")
+    cover = "\n".join(f"line {i}" for i in range(500))
+    stego = ws_encode(ct, cover)
+    result = analyze(stego, "ws")
+    assert result["declared_length"] == len(ct)
+    assert not result["header_corrupted"]
+
+
+def test_analyze_truncated_payload_marks_header_corrupted():
+    # encode, then strip off payload bits so declared length won't fit
+    secret = b"long enough payload here ok"
+    ct = encrypt_message(secret, "pw")
+    cover = "plain cover text" * 50
+    stego = zw_encode(ct, cover)
+    # delete 80% of the zw chars by rebuilding it without some of them
+    zw_chars = [c for c in stego if c in (_ZWS, _ZWNJ)]
+    stripped = "".join(zw_chars[: len(zw_chars) // 5])
+    result = analyze(stripped, "zw")
+    # First 32 bits may still decode to a declared length > what's left
+    if result["declared_length"] is not None:
+        assert result["header_corrupted"]
+
+
+def test_analyze_wrong_method_rejected():
+    with pytest.raises(ValueError):
+        analyze("text", "bogus")
+
+
+def test_analyze_type_check():
+    with pytest.raises(TypeError):
+        analyze(b"not str", "zw")
+
+
