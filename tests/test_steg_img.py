@@ -9,7 +9,7 @@ import random
 
 import pytest
 
-from steg import img_capacity, img_encode, img_decode, hide, reveal
+from steg import img_capacity, img_encode, img_decode, hide, reveal, hide_img, reveal_img
 
 
 # ---------------------------------------------------------------------------
@@ -160,4 +160,121 @@ def test_img_truncated_returns_empty():
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     assert img_decode(buf.getvalue()) == b""
+
+
+# ---------------------------------------------------------------------------
+# hide_img / reveal_img — high-level encrypt+encode / decode+decrypt
+# ---------------------------------------------------------------------------
+
+def test_hide_img_reveal_img_round_trip():
+    cover = _make_png_bytes(64, 64)
+    secret = b"meet at dawn at the docks"
+    stego = hide_img(secret, "horse staple", cover)
+    assert reveal_img(stego, "horse staple") == secret
+
+
+def test_reveal_img_no_payload_raises():
+    cover = _make_png_bytes(16, 16)  # natural PNG, no LSB payload -> decode empty
+    with pytest.raises(ValueError, match="no hidden message"):
+        reveal_img(cover, "pw")
+
+
+def test_reveal_img_wrong_password_returns_invalidtoken():
+    from cryptography.fernet import InvalidToken
+    cover = _make_png_bytes(64, 64)
+    stego = hide_img(b"the eagle flies at midnight", "right", cover)
+    with pytest.raises(InvalidToken):
+        reveal_img(stego, "wrong")
+
+
+# ---------------------------------------------------------------------------
+# CLI: encode -m img / decode -m img via binary file paths
+# ---------------------------------------------------------------------------
+
+import sys
+import tempfile
+import io  # already imported above
+
+from steg import main
+
+
+def _run_cli_img(argv):
+    """Call main(argv) for img CLI (no stdin). Returns (rc, stdout, stderr)."""
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    try:
+        rc = main(argv)
+        return rc, sys.stdout.getvalue(), sys.stderr.getvalue()
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+def test_cli_encode_decode_img_via_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.png")
+        stego_path = os.path.join(tmp, "stego.png")
+        with open(cover_path, "wb") as f:
+            f.write(_make_png_bytes(64, 64))
+        rc, _, err = _run_cli_img([
+            "encode", "-m", "img", "-p", "mypw",
+            "-s", "top secret image payload",
+            "-c", cover_path, "-o", stego_path,
+        ])
+        assert rc == 0, f"encode failed: {err}"
+        # stego should be a real PNG
+        from PIL import Image
+        Image.open(stego_path).verify()
+        rc, out, err = _run_cli_img([
+            "decode", "-m", "img", "-p", "mypw",
+            "-i", stego_path,
+        ])
+        assert rc == 0, f"decode failed: {err}"
+        assert out == "top secret image payload"
+
+
+def test_cli_encode_img_refuses_jpeg_output():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.png")
+        with open(cover_path, "wb") as f:
+            f.write(_make_png_bytes(32, 32))
+        rc, _, err = _run_cli_img([
+            "encode", "-m", "img", "-p", "pw", "-s", "secret",
+            "-c", cover_path, "-o", os.path.join(tmp, "out.jpg"),
+        ])
+        assert rc == 2, f"expected rc=2 got {rc}, err={err}"
+        assert ".jpg" in err or "png" in err, f"expected a png/jpg note in: {err}"
+
+
+def test_cli_encode_img_wrong_password_returns_3():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.png")
+        stego_path = os.path.join(tmp, "stego.png")
+        with open(cover_path, "wb") as f:
+            f.write(_make_png_bytes(64, 64))
+        rc, _, _ = _run_cli_img([
+            "encode", "-m", "img", "-p", "right",
+            "-s", "secret", "-c", cover_path, "-o", stego_path,
+        ])
+        assert rc == 0
+        rc, out, err = _run_cli_img([
+            "decode", "-m", "img", "-p", "wrong", "-i", stego_path,
+        ])
+        assert rc == 3
+        assert "wrong password" in err or "corrupted" in err
+
+
+def test_cli_encode_img_cover_too_small_returns_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_path = os.path.join(tmp, "cover.png")
+        with open(cover_path, "wb") as f:
+            f.write(_make_png_bytes(2, 2))  # tiny
+        rc, _, err = _run_cli_img([
+            "encode", "-m", "img", "-p", "pw",
+            "-s", "x" * 50,  # payload > capacity
+            "-c", cover_path, "-o", os.path.join(tmp, "stego.png"),
+        ])
+        assert rc == 2
+        assert "cover too small" in err
+
 

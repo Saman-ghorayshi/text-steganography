@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import os
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -360,7 +361,7 @@ def analyze(text: str, method: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def hide(secret: bytes, password: str, cover: str, method: str) -> str:
-    """Encrypt then stego-encode. method is 'ws' or 'zw'."""
+    """Encrypt then stego-encode (text methods). method is 'ws' or 'zw'."""
     ct = encrypt_message(secret, password)
     if method == "ws":
         return ws_encode(ct, cover)
@@ -370,13 +371,28 @@ def hide(secret: bytes, password: str, cover: str, method: str) -> str:
 
 
 def reveal(stego_text: str, password: str, method: str) -> bytes:
-    """Stego-decode then decrypt. Returns the original secret bytes."""
+    """Stego-decode then decrypt (text methods). Returns original secret bytes."""
     if method == "ws":
         ct = ws_decode(stego_text)
     elif method == "zw":
         ct = zw_decode(stego_text)
     else:
         raise ValueError(f"unknown method: {method!r}")
+    if not ct:
+        raise ValueError("no hidden message found in input")
+    return decrypt_message(ct, password)
+
+
+# Image variants: cover and stego are bytes (PNG file bytes), not str.
+def hide_img(secret: bytes, password: str, cover_png: bytes) -> bytes:
+    """Encrypt then hide in a PNG cover. Returns stego PNG bytes."""
+    ct = encrypt_message(secret, password)
+    return img_encode(ct, cover_png)
+
+
+def reveal_img(stego_png: bytes, password: str) -> bytes:
+    """Decode an LSB-PNG payload then decrypt. Raises if stego carries nothing."""
+    ct = img_decode(stego_png)
     if not ct:
         raise ValueError("no hidden message found in input")
     return decrypt_message(ct, password)
@@ -404,6 +420,34 @@ def _write_text(path: str, text: str) -> None:
     else:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+
+
+def _read_bytes(path: str) -> bytes:
+    if path == "-":
+        return getattr(sys.stdin, "buffer", sys.stdin).read()
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    if path == "-":
+        getattr(sys.stdout, "buffer", sys.stdout).write(data)
+    else:
+        with open(path, "wb") as f:
+            f.write(data)
+
+
+def _png_only(path: str) -> None:
+    """Refuse any non-PNG output extension for the image method. JPEG/WebP
+    would re-encode lossy and silently destroy the LSB payload — letting it
+    through is a footgun, not a feature.
+    """
+    lower = path.lower()
+    if lower != "-" and not (lower.endswith(".png") or os.path.basename(lower) == ""):
+        raise ValueError(
+            f"refusing non-PNG output {path!r}: lossy encoders (JPEG, WebP) "
+            "would destroy the LSB payload"
+        )
 
 
 def _print_analysis(result: dict, json_output: bool) -> None:
@@ -436,22 +480,26 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     enc = sub.add_parser("encode", help="hide a secret message in cover text")
-    enc.add_argument("-m", "--method", choices=["ws", "zw"], required=True,
+    enc.add_argument("-m", "--method", choices=["ws", "zw", "img"], required=True,
                       help="ws = whitespace (space/tab at end of lines), "
-                           "zw = zero-width Unicode chars")
+                           "zw = zero-width Unicode chars, "
+                           "img = PNG LSB in pixel channel bytes")
     enc.add_argument("-p", "--password", required=True, help="encryption password")
     enc.add_argument("-s", "--secret", required=True, help="secret message text to hide")
     enc.add_argument("-c", "--cover", default="-",
-                      help="cover text file (default: stdin)")
+                      help="cover text file or, for -m img, PNG cover path "
+                           "(default: stdin)")
     enc.add_argument("-o", "--output", default="-",
-                      help="output file for stego text (default: stdout)")
+                      help="output file for stego text/image (default: stdout). "
+                           "For -m img, must end in .png; lossy formats are refused.")
 
     dec = sub.add_parser("decode", help="extract a secret message from stego text")
-    dec.add_argument("-m", "--method", choices=["ws", "zw"], required=True,
-                      help="ws = whitespace, zw = zero-width Unicode")
+    dec.add_argument("-m", "--method", choices=["ws", "zw", "img"], required=True,
+                      help="ws = whitespace, zw = zero-width, img = PNG LSB")
     dec.add_argument("-p", "--password", required=True, help="decryption password")
     dec.add_argument("-i", "--input", default="-",
-                     help="input stego text (default: stdin)")
+                     help="input stego text or, for -m img, stego PNG path "
+                          "(default: stdin)")
     dec.add_argument("-o", "--output", default="-",
                      help="output file for secret (default: stdout)")
     dec.add_argument("--analyze", action="store_true",
@@ -477,16 +525,43 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "encode":
-        cover = _read_text(args.cover)
         try:
-            stego = hide(args.secret.encode("utf-8"), args.password, cover, args.method)
-        except (ValueError, TypeError) as e:
+            if args.method == "img":
+                _png_only(args.output)
+                cover = _read_bytes(args.cover)
+                stego = hide_img(args.secret.encode("utf-8"), args.password, cover)
+                _write_bytes(args.output, stego)
+            else:
+                cover = _read_text(args.cover)
+                stego = hide(args.secret.encode("utf-8"), args.password, cover, args.method)
+                _write_text(args.output, stego)
+        except (ValueError, TypeError, ImportError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
-        _write_text(args.output, stego)
         return 0
 
     if args.command == "decode":
+        if args.method == "img" and args.analyze:
+            # not yet supported for img: no analyze() impl in commit 3.
+            print(f"error: --analyze does not yet support method 'img'", file=sys.stderr)
+            return 2
+        if args.method == "img":
+            try:
+                stego = _read_bytes(args.input)
+            except OSError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            try:
+                secret = reveal_img(stego, args.password)
+            except ValueError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            except InvalidToken:
+                print("error: wrong password or corrupted payload", file=sys.stderr)
+                return 3
+            _write_text(args.output, secret.decode("utf-8"))
+            return 0
+
         stego = _read_text(args.input)
         if args.analyze:
             # Report payload without decryption. Password is irrelevant here,
