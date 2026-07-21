@@ -268,6 +268,7 @@ def reveal(stego_text: str, password: str, method: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 import argparse
+import json
 import sys
 
 
@@ -284,6 +285,27 @@ def _write_text(path: str, text: str) -> None:
     else:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+
+
+def _print_analysis(result: dict, json_output: bool) -> None:
+    """Human (default) or JSON line for the analyze() result."""
+    if json_output:
+        print(json.dumps(result))
+        return
+    if result["payload_chars"] == 0:
+        print(f"[{result['method']}] no payload characters found")
+        return
+    declared = result["declared_length"]
+    if declared is None:
+        print(f"[{result['method']}] {result['payload_chars']} payload chars - "
+              f"{result['payload_byte_count']} bytes encoded, length header "
+              "not readable")
+        return
+    note = " (header looks corrupted: declared length exceeds payload bytes)" \
+        if result["header_corrupted"] else ""
+    print(f"[{result['method']}] {result['payload_chars']} payload chars - "
+          f"{result['payload_byte_count']} bytes encoded, declared "
+          f"{declared} bytes payload{note}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -313,9 +335,21 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="input stego text (default: stdin)")
     dec.add_argument("-o", "--output", default="-",
                      help="output file for secret (default: stdout)")
+    dec.add_argument("--analyze", action="store_true",
+                     help="only report what the stego text carries; do not "
+                          "decrypt. Exits 0 if a payload header is readable, "
+                          "2 if none. Does not require the password to be "
+                          "correct.")
 
-    # ponytail: skipped - analyze subcommand to detect whether a text contains
-    # hidden stego payload without the password. Add when needed.
+    det = sub.add_parser("detect",
+                         help="steganalysis: detect hidden payload WITHOUT the "
+                              "password. Reads the declared length header.")
+    det.add_argument("-m", "--method", choices=["ws", "zw"], required=True,
+                      help="ws = whitespace, zw = zero-width Unicode")
+    det.add_argument("-i", "--input", default="-",
+                     help="input text to analyze (default: stdin)")
+    det.add_argument("--json", action="store_true",
+                     help="emit machine-readable JSON instead of human text")
     return parser
 
 
@@ -335,6 +369,16 @@ def main(argv=None) -> int:
 
     if args.command == "decode":
         stego = _read_text(args.input)
+        if args.analyze:
+            # Report payload without decryption. Password is irrelevant here,
+            # but argparse still required it on the route - tolerate either way.
+            try:
+                result = analyze(stego, args.method)
+            except (ValueError, TypeError) as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            _print_analysis(result, json_output=False)
+            return 0 if result["declared_length"] is not None else 2
         try:
             secret = reveal(stego, args.password, args.method)
         except ValueError as e:
@@ -345,6 +389,16 @@ def main(argv=None) -> int:
             return 3
         _write_text(args.output, secret.decode("utf-8"))
         return 0
+
+    if args.command == "detect":
+        text = _read_text(args.input)
+        try:
+            result = analyze(text, args.method)
+        except (ValueError, TypeError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        _print_analysis(result, json_output=args.json)
+        return 0 if result["declared_length"] is not None else 2
 
     parser.error(f"unknown command: {args.command}")
 
