@@ -196,6 +196,103 @@ def img_capacity(width: int, height: int) -> int:
     return (width * height * 3) // 8 - 4
 
 
+def _require_pil():
+    try:
+        from PIL import Image  # noqa: F401
+        return Image
+    except ImportError as e:
+        raise ImportError(
+            "image method requires Pillow: pip install Pillow"
+        ) from e
+
+
+def img_encode(data: bytes, cover_png: bytes) -> bytes:
+    """Hide `data` in the LSBs of an RGB PNG. Returns new PNG bytes.
+
+    RGB channels only (alpha untouched). Capacity = img_capacity(w, h).
+    Raises ValueError if the cover is too small or `cover_png` is not a PNG.
+    Raises ImportError with install hint if Pillow is unavailable.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not isinstance(cover_png, bytes):
+        raise TypeError("cover_png must be bytes")
+    Image = _require_pil()
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(cover_png))
+    except Exception as e:
+        raise ValueError(f"cover is not a readable image: {e}")
+    img.load()
+
+    # Convert to whatever mode it's in; we keep mode but operate on RGB(A) list
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    pixels = list(img.getdata())
+    has_alpha = img.mode == "RGBA"
+    width, height = img.size
+    capacity = (width * height * 3) // 8 - 4
+    payload = _length_prefix(data)
+    if len(payload) > capacity:
+        raise ValueError(
+            f"cover too small: need {len(payload)} bytes of LSB capacity, have {capacity}"
+        )
+    bits = _bytes_to_bits(payload)
+
+    out = []
+    bit_idx = 0
+    for px in pixels:
+        channels = list(px)
+        # strip alpha if present so tuple length matches image mode
+        if not has_alpha and len(channels) > 3:
+            channels = channels[:3]
+        # write into R, G, B only (alpha untouched on RGBA covers)
+        for ch in range(3):
+            if bit_idx < len(bits):
+                channels[ch] = (channels[ch] & 0xFE) | (bits[bit_idx] == "1")
+                bit_idx += 1
+        out.append(tuple(channels))
+
+    stego_img = Image.new(img.mode, img.size)
+    stego_img.putdata(out)
+    buf = _io.BytesIO()
+    stego_img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def img_decode(stego_png: bytes) -> bytes:
+    """Recover the payload hidden by img_encode. Returns the bytes (empty on
+    a malformed/empty payload so callers can signal 'no hidden message').
+    """
+    if not isinstance(stego_png, bytes):
+        raise TypeError("stego_png must be bytes")
+    Image = _require_pil()
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(stego_png))
+    except Exception as e:
+        raise ValueError(f"stego is not a readable image: {e}")
+    img.load()
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    pixels = list(img.getdata())
+
+    bits = ""
+    for px in pixels:
+        for ch in range(3):
+            bits += str(px[ch] & 1)
+
+    if len(bits) < 32:
+        return b""
+    declared = int(bits[:32], 2)
+    needed = 32 + declared * 8
+    if needed > len(bits):
+        return b""  # truncated / corrupted
+    return _bits_to_bytes(bits[32:needed])
+
+
 # ---------------------------------------------------------------------------
 # Steganalysis helper: detect payload + read declared length WITHOUT password.
 # Demonstrates the boundary: steganography hides content, not existence.
