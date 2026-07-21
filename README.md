@@ -1,6 +1,6 @@
 # text-steganography
 
-Hide secret messages inside plain text or images using three steganography methods, with password-based encryption. The hidden bytes are AES-encrypted before encoding, so even if an attacker detects the payload, they cannot read the message without the password.
+Hide secret messages inside plain text, images, or audio using four steganography methods, with password-based encryption. The hidden bytes are AES-encrypted before encoding, so even if an attacker detects the payload, they cannot read the message without the password.
 
 Live demo: https://username.github.io/text-steganography/
 
@@ -8,7 +8,7 @@ A self-contained browser demo (single HTML file, no dependencies, no backend) im
 
 ## Methods
 
-This tool implements three steganography techniques. Each has different robustness properties, so choose based on how the cover will be transported.
+This tool implements four steganography techniques. Each has different robustness properties, so choose based on how the cover will be transported.
 
 ### Zero-width Unicode
 
@@ -36,6 +36,15 @@ Hide a payload in the least-significant bits of the R, G, and B channels of a PN
 - Works only on PNGs (lossless). Outputting JPEG/WebP is refused explicitly because lossy re-encode would silently destroy the LSB payload.
 - Capacity is `width * height * 3 / 8 - 4` bytes — a 256x256 PNG hides ~24 KiB of ciphertext, 1024x1024 hides ~384 KiB.
 - Does not survive re-encoding through any lossy codec (JPEG, WebP with lossy mode), or any image tool that re-quantizes or rebuilds pixels.
+
+### Audio (WAV 16-bit PCM LSB)
+
+Hide a payload in the least-significant bit of each 16-bit signed PCM sample of a WAV cover. One payload bit per sample, walked in frame order, channels in order (L then R per frame for stereo).
+
+- The cover sounds identical — each sample value changes by at most 1 unit out of 65,536, a ~0.0015% difference the ear cannot detect.
+- Works only on 16-bit signed little-endian PCM WAVs. 8-bit unsigned, 24/32-bit float, and compressed WAVs (ADPCM, A-law) are refused explicitly because the LSB math or the re-packing would silently destroy the payload.
+- Capacity is `nframes * nchannels / 8 - 4` bytes — an 8,000-frame mono WAV at 8 kHz (1 second of audio) hides ~996 bytes; a 44,100-frame stereo WAV (1 second of CD audio) hides ~11,021 bytes.
+- Does not survive re-encoding through any lossy codec (MP3, AAC, OGG, or FLAC-conversion with re-quantization). The CLI refuses `.mp3`/`.aac`/`.ogg` output for this method.
 
 ## How it works
 
@@ -87,6 +96,20 @@ $ python steg.py encode -m img -p mypassword -s "secret" -c cover.png -o stego.j
 error: refusing non-PNG output 'stego.jpg': lossy encoders (JPEG, WebP) would destroy the LSB payload
 ```
 
+Hide a secret in a 16-bit PCM WAV cover (lossless audio LSB):
+
+```
+python steg.py encode -m wav -p mypassword -s "the secret payload" -c cover.wav -o stego.wav
+python steg.py decode -m wav -p mypassword -i stego.wav
+```
+
+Non-WAV audio output extensions are refused for the same reason as non-PNG:
+
+```
+$ python steg.py encode -m wav -p mypassword -s "secret" -c cover.wav -o stego.mp3
+error: refusing non-WAV output 'stego.mp3': lossy encoders (MP3, AAC, OGG) would destroy the sample-LSB payload
+```
+
 Use stdin/stdout by omitting the file arguments (or passing `-`):
 
 ```
@@ -101,6 +124,8 @@ python steg.py detect -m zw -i stego.txt
 python steg.py detect -m zw --json -i stego.txt | jq .
 python steg.py detect -m img -i stego.png         # reports LSB distribution
 python steg.py detect -m img --json -i stego.png  # machine-readable
+python steg.py detect -m wav -i stego.wav         # reports sample-LSB distribution
+python steg.py detect -m wav --json -i stego.wav  # machine-readable
 ```
 
 Same information without decrypting, from the decode verb:
@@ -141,6 +166,19 @@ with open("stego.png", "wb") as f:
 secret_bytes = reveal_img(stego_png, "mypassword")
 ```
 
+For the audio method the cover and stego are bytes (WAV file contents):
+```python
+from steg import hide_wav, reveal_wav
+
+with open("cover.wav", "rb") as f:
+    cover_wav = f.read()
+stego_wav = hide_wav(b"meet at dawn", "mypassword", cover_wav)
+with open("stego.wav", "wb") as f:
+    f.write(stego_wav)
+# Reveal
+secret_bytes = reveal_wav(stego_wav, "mypassword")
+```
+
 The two layers can also be used separately:
 
 ```python
@@ -153,19 +191,20 @@ recovered = decrypt_message(zw_decode(stego), "password")
 
 ## Method comparison
 
-| Property | zero-width | whitespace | image (PNG LSB) |
-|---|---|---|---|
-| Cover type | text | text | PNG image |
-| Invisible to naked eye | Yes | No (trailing tabs visible in some editors) | Yes (pixel values change by at most 1) |
-| Survives copy-paste | Yes | Yes | N/A (binary; copy-paste of images depends on the tool, but bits stay intact on a byte-for-byte PNG copy) |
-| Survives lossy re-encode | N/A | N/A | No (JPEG, WebP destroy LSBs; only PNG and other lossless formats preserve them) |
-| Survives whitespace stripping | Yes | No | N/A |
-| Survives Unicode sanitizing | No | Yes | N/A |
-| Cover size requirement | None | At least one line per payload bit | `width * height * 3 / 8 - 4` bytes of payload space |
-| Detectable by layperson | No | Possibly (trailing tabs) | No |
-| Detectable by steganalysis | Yes (cluster after char[0]) | Yes (trailing whitespace is rare) | Yes (LSB distribution differs from natural LSB noise) |
+| Property | zero-width | whitespace | image (PNG LSB) | audio (WAV 16-bit PCM LSB) |
+|---|---|---|---|---|
+| Cover type | text | text | PNG image | 16-bit signed PCM WAV |
+| Invisible to naked eye | Yes | No (trailing tabs visible in some editors) | Yes (pixel values change by at most 1) | Inaudible (sample values change by at most 1 of 65,536) |
+| Survives copy-paste | Yes | Yes | N/A (binary; copy-paste of images depends on the tool, but bits stay intact on a byte-for-byte PNG copy) | N/A (binary; depends on exact-byte transport) |
+| Survives lossy re-encode | N/A | N/A | No (JPEG, WebP destroy LSBs; only PNG and other lossless formats preserve them) | No (MP3, AAC, OGG destroy sample LSBs; only uncompressed PCM WAV preserves them) |
+| Survives whitespace stripping | Yes | No | N/A | N/A |
+| Survives Unicode sanitizing | No | Yes | N/A | N/A |
+| Cover size requirement | None | At least one line per payload bit | `width * height * 3 / 8 - 4` bytes of payload space | `nframes * nchannels / 8 - 4` bytes of payload space |
+| Capacity | Low (one bit per cover char inserted) | One bit per cover line | High (~384 KiB in 1024x1024) | Medium (~996 bytes in 1s of 8kHz mono; ~11 KiB in 1s of CD-quality stereo) |
+| Detectable by layperson | No | Possibly (trailing tabs) | No | No |
+| Detectable by steganalysis | Yes (cluster after char[0]) | Yes (trailing whitespace is rare) | Yes (LSB distribution differs from natural LSB noise) | Yes (sample-LSB distribution differs from natural LSB noise) |
 
-Pick zero-width for text that will be read by humans and copy-pasted as text. Pick whitespace for contexts that strip zero-width characters but preserve trailing whitespace (raw text files, some source code, plain text email). Pick image if the cover is a PNG you control end-to-end — it's the highest-capacity option and survives any lossless transport, but dies the moment anyone re-encodes it lossy.
+Pick zero-width for text that will be read by humans and copy-pasted as text. Pick whitespace for contexts that strip zero-width characters but preserve trailing whitespace (raw text files, some source code, plain text email). Pick image if the cover is a PNG you control end-to-end — it's the highest-capacity option and survives any lossless transport, but dies the moment anyone re-encodes it lossy. Pick audio if the cover is a 16-bit PCM WAV you control end-to-end — the payload rides each sample's LSB and is inaudible, but it dies the moment anyone re-encodes it through a lossy codec (MP3, AAC, OGG) or even a lossless re-pack that re-quantizes.
 
 ## Detection
 
@@ -177,6 +216,8 @@ Steganography hides bytes from the eye, not from statistical analysis. The brows
 
 For the image method, `python steg.py detect -m img` reports the LSB distribution (how many ones vs zeros across all R/G/B channels) and a simple `suspicious` flag: a readable non-zero length header that fits inside the image's LSB capacity is itself the steganographic signal — random LSB noise would not produce such a tight length prefix. This is the honest minimum for a portfolio piece; a real chi-square steganalyzer is a follow-up.
 
+For the audio method, `python steg.py detect -m wav -i stego.wav` reports the sample-LSB distribution (how many ones vs zeros across every 16-bit sample) and the same readable-header `suspicious` flag. The length header survives without the password, so `detect` can tell an attacker exactly how many bytes are hidden in the cover audio — the same honesty as the image method.
+
 This demonstrates a fundamental property of LSB-style steganography: it hides content from humans, not from analysis tools. The password protects the message content, not the existence of the message.
 
 ## Tests
@@ -185,7 +226,7 @@ This demonstrates a fundamental property of LSB-style steganography: it hides co
 python -m pytest tests/ -v
 ```
 
-The test suite includes round-trip tests, fuzz tests (random byte payloads across random cover sizes), edge cases (empty cover, empty payload, truncated payload, corrupted ciphertext, wrong password, Unicode cover text, 1 MB payloads, RGBA alpha preserved, cover-too-small capacity rejection), and end-to-end tests driving the CLI through `main()`. The text and image test modules are split for clarity.
+The test suite includes round-trip tests, fuzz tests (random byte payloads across random cover sizes), edge cases (empty cover, empty payload, truncated payload, corrupted ciphertext, wrong password, Unicode cover text, 1 MB payloads, RGBA alpha preserved, 8-bit-WAV refusal, cover-too-small capacity rejection), and end-to-end tests driving the CLI through `main()`. The text, image, and audio test modules are split for clarity.
 
 ## Limitations
 
@@ -196,6 +237,9 @@ The test suite includes round-trip tests, fuzz tests (random byte payloads acros
 - **Image method refuses non-PNG output** (JPEG, WebP, etc.) because lossy re-encode destroys the LSB payload. Sending a stego PNG through any tool that re-encodes lossy will silently destroy the hidden message.
 - **Image steganalysis here is a length-header sanity check.** The `suspicious` flag is intentionally simple; a real chi-square LSB steganalyzer is a polish follow-up listed in the project plans.
 - **Neither text method survives lossy transport.** Screenshots, OCR, text-to-speech, and some Markdown renderers destroy the payload.
+- **Audio method writes only the LSB of 16-bit signed PCM samples.** Only a single bit per sample is available. Higher-bit-plane writes would change sample values more (and be audible); multi-format support (8-bit, 24/32-bit float) is left for the format-extension commit named in the project plans.
+- **Audio method refuses non-WAV output** (MP3, AAC, OGG, etc.) because lossy re-encode destroys the sample-level LSB payload. Converting a stego WAV to MP3 and back destroys the message silently. Even some lossless formats (FLAC, ALAC) can re-pack samples in ways that break the bit-for-bit round-trip — only uncompressed PCM WAV is guaranteed.
+- **Audio steganalysis here is the same length-header sanity check.** The `suspicious` flag on `detect -m wav` is intentionally simple; a real chi-square steganalyzer for audio LSB is in the same polish follow-up as the image detector.
 - **Browser demo uses AES-GCM, not Fernet.** Fernet is Python-specific and has no JavaScript equivalent. The browser demo uses Web Crypto's AES-256-GCM with the same SHA-256 key derivation. Encoded text from the Python tool cannot be decoded by the browser demo and vice versa, but the same password works on both sides of each tool.
 
 ## Project layout
@@ -204,6 +248,7 @@ The test suite includes round-trip tests, fuzz tests (random byte payloads acros
 steg.py                tool and library (encryption + steganography, CLI, hide/reveal wrappers)
 tests/test_steg.py     text-method test suite (whitespace, zero-width)
 tests/test_steg_img.py image-method test suite (PNG LSB, CLI, detect)
+tests/test_steg_wav.py audio-method test suite (WAV 16-bit PCM LSB, CLI, detect)
 docs/                  teaching pages + live demo (GitHub Pages)
   index.html           landing + demo tabs
   whitespace.html      how the whitespace method works
