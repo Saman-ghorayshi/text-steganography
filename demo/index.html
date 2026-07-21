@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>text-steganography demo</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #21262d;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent-hover: #79b8ff;
+    --danger: #f85149;
+    --success: #56d364;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  main {
+    max-width: 1000px;
+    margin: 40px auto 80px;
+    padding: 0 24px;
+  }
+  header { margin-bottom: 32px; }
+  h1 {
+    font-size: 24px;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+  }
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 14px;
+  }
+  .source-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 13px;
+    margin-left: 8px;
+  }
+  .source-link:hover { color: var(--accent-hover); }
+
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    padding: 10px 16px;
+    background: transparent;
+    color: var(--text-dim);
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .tab.active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+  }
+  .tab:hover:not(.active) { color: var(--text); }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .panel h2 {
+    margin: 0 0 16px 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  textarea, input[type="text"], input[type="password"] {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 13px;
+    margin-bottom: 12px;
+    resize: vertical;
+  }
+  textarea { min-height: 80px; }
+  input[type="text"]:focus, input[type="password"]:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .row > * { flex: 1; margin-bottom: 0; }
+  .btn {
+    padding: 10px 16px;
+    background: var(--accent);
+    color: #0d1117;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .btn:hover { background: var(--accent-hover); }
+  .btn-secondary {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover {
+    background: var(--border);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .status {
+    margin-top: 12px;
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 13px;
+    display: none;
+  }
+  .status.show { display: block; }
+  .status.error {
+    background: rgba(248, 81, 73, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(248, 81, 73, 0.3);
+  }
+  .status.success {
+    background: rgba(86, 211, 100, 0.15);
+    color: var(--success);
+    border: 1px solid rgba(86, 211, 100, 0.3);
+  }
+  .status.info {
+    background: rgba(88, 166, 255, 0.1);
+    color: var(--accent);
+    border: 1px solid rgba(88, 166, 255, 0.3);
+  }
+  .info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+  }
+  @media (max-width: 700px) {
+    .info-grid { grid-template-columns: 1fr; }
+  }
+  .method-info {
+    padding: 16px;
+    background: var(--panel-2);
+    border-radius: 4px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-dim);
+  }
+  .method-info strong { color: var(--text); }
+  .method-info .label {
+    display: inline-block;
+    padding: 2px 8px;
+    background: var(--bg);
+    border-radius: 3px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-right: 8px;
+  }
+  .ascii-art {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: pre;
+    overflow-x: auto;
+    margin-top: 12px;
+    padding: 8px;
+    background: var(--bg);
+    border-radius: 4px;
+  }
+  .ascii-art .zw { color: var(--accent); font-weight: bold; }
+  .ascii-art .ws { color: var(--success); font-weight: bold; }
+  footer {
+    margin-top: 60px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  details {
+    margin-top: 12px;
+  }
+  details summary {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: 13px;
+    padding: 4px 0;
+  }
+  details[open] summary { margin-bottom: 8px; }
+  * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>text-steganography <a class="source-link" href="https://github.com/Samsha/text-steganography" target="_blank" rel="noopener">source on github</a></h1>
+    <div class="subtitle">
+      Hide an encrypted secret message inside plain text using invisible
+      Unicode characters or trailing whitespace. Decoding requires the password.
+      Everything runs in your browser; nothing is uploaded.
+    </div>
+  </header>
+
+  <div class="info-grid">
+    <div class="method-info">
+      <div><span class="label">zero-width</span> insert invisible Unicode chars</div>
+      <div style="margin-top: 8px">
+        Cover text looks identical to the naked eye. Survives most copy-paste
+        and editing. Does not survive platforms that sanitize zero-width
+        characters (WhatsApp, Discord, some email clients).
+      </div>
+    </div>
+    <div class="method-info">
+      <div><span class="label">whitespace</span> trailing space/tab at line ends</div>
+      <div style="margin-top: 8px">
+        Each payload bit becomes a trailing space (0) or tab (1) on a line of
+        cover. Survives most text editors. Does not survive tools that strip
+        trailing whitespace (Markdown renderers, code formatters).
+      </div>
+    </div>
+  </div>
+
+  <div class="ascii-art">
+<span class="zw">zero-width:</span>   H<span class="zw">&#8203;&#8204;&#8203;</span>ello world        (invisible chars inserted after first char)
+<span class="ws">whitespace:</span>  hello<span class="ws"> </span>        (trailing space = bit 0)
+              world<span class="ws">&#9;</span>       (trailing tab = bit 1)
+  </div>
+
+  <div class="tabs" style="margin-top: 32px">
+    <button class="tab active" data-tab="encode">Encode</button>
+    <button class="tab" data-tab="decode">Decode</button>
+    <button class="tab" data-tab="detect">Detect</button>
+  </div>
+
+  <!-- ENCODE -->
+  <div id="tab-encode" class="tab-content">
+    <div class="panel">
+      <h2>Hide a secret message</h2>
+      <label for="enc-cover">Cover text (the message everyone sees)</label>
+      <textarea id="enc-cover" placeholder="the weather is nice today, see you at the cafe at noon"></textarea>
+      <label for="enc-secret">Secret message (the message only the password holder can read)</label>
+      <textarea id="enc-secret" placeholder="the safe combination is 1234"></textarea>
+      <label for="enc-password">Password</label>
+      <input type="password" id="enc-password" placeholder="decryption password" />
+      <label for="enc-method">Method</label>
+      <select id="enc-method" style="padding: 10px 12px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; font-size: 13px; margin-bottom: 12px; width: 100%">
+        <option value="zw">zero-width Unicode (invisible, survives whitespace stripping)</option>
+        <option value="ws">whitespace (trailing space/tab, survives unicode sanitizing)</option>
+      </select>
+      <div class="actions">
+        <button class="btn" id="enc-btn">Encode</button>
+        <button class="btn btn-secondary" id="enc-clear">Clear</button>
+      </div>
+      <div class="status" id="enc-status"></div>
+      <label for="enc-output" style="margin-top: 12px">Output (copy this and send it)</label>
+      <textarea id="enc-output" readonly placeholder="encoded text will appear here"></textarea>
+      <div class="actions">
+        <button class="btn btn-secondary" id="enc-copy">Copy output</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DECODE -->
+  <div id="tab-decode" class="tab-content" style="display: none">
+    <div class="panel">
+      <h2>Extract a secret message</h2>
+      <label for="dec-input">Stego text (the text you received)</label>
+      <textarea id="dec-input" placeholder="paste the encoded text here"></textarea>
+      <label for="dec-password">Password</label>
+      <input type="password" id="dec-password" placeholder="decryption password" />
+      <label for="dec-method">Method</label>
+      <select id="dec-method" style="padding: 10px 12px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; font-size: 13px; margin-bottom: 12px; width: 100%">
+        <option value="zw">zero-width Unicode</option>
+        <option value="ws">whitespace</option>
+      </select>
+      <div class="actions">
+        <button class="btn" id="dec-btn">Decode</button>
+        <button class="btn btn-secondary" id="dec-clear">Clear</button>
+      </div>
+      <div class="status" id="dec-status"></div>
+      <label for="dec-output" style="margin-top: 12px">Secret message</label>
+      <textarea id="dec-output" readonly placeholder="extracted message will appear here"></textarea>
+    </div>
+  </div>
+
+  <!-- DETECT -->
+  <div id="tab-detect" class="tab-content" style="display: none">
+    <div class="panel">
+      <h2>Detect hidden payload (no password needed)</h2>
+      <div class="method-info" style="margin-bottom: 16px">
+        Steganography hides bytes from the eye, not from statistical analysis.
+        Paste any text here to see whether it carries hidden zero-width chars
+        or unexpected trailing whitespace, and how many payload bytes that
+        implies. No password required - detection is not the same as
+        decryption, but it reveals that a hidden message exists.
+      </div>
+      <label for="det-input">Text to analyze</label>
+      <textarea id="det-input" placeholder="paste text here"></textarea>
+      <div class="actions">
+        <button class="btn" id="det-btn">Analyze</button>
+      </div>
+      <div class="status" id="det-status"></div>
+      <details>
+        <summary>How detection works</summary>
+        <div class="method-info">
+          <p><strong>zero-width method:</strong> the encoder inserts U+200B and U+200C
+          characters into the text. These chars never appear in normal prose.
+          Counting them immediately reveals the number of bits, and dividing by
+          8 gives the hidden byte count. The first 32 bits are the length header,
+          so you can read the declared payload size without ever decrypting.</p>
+          <p><strong>whitespace method:</strong> trailing tabs are extremely rare
+          in normal text. A high count of trailing tabs across many lines is
+          strong evidence of a hidden payload. The decoder reads them as bits
+          to get the length header.</p>
+          <p>Both methods are designed to resist casual visual inspection, not
+          statistical steganalysis. This is a fundamental property of LSB-style
+          steganography: it hides content from humans, not from analysis tools.</p>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <footer>
+    MIT licensed. Crypto via Web Crypto API (AES-256-GCM).
+    This page is a single self-contained HTML file - no JS dependencies,
+    no backend, no tracking. Works offline.
+  </footer>
+</main>
+
+<script>
+const ZWS = "\u200B";  // zero-width space     -> bit 0
+const ZWNJ = "\u200C";  // zero-width non-joiner -> bit 1
+const PAYLOAD_ZW = new Set([ZWS, ZWNJ]);
+
+// ---------- bit helpers (mirror of steg.py) ----------
+function bytesToBits(bytes) {
+  return Array.from(bytes, b => b.toString(2).padStart(8, "0")).join("");
+}
+function bitsToBytes(bits) {
+  const out = new Uint8Array(Math.floor(bits.length / 8));
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(bits.substr(i * 8, 8), 2);
+  }
+  return out;
+}
+function lengthPrefix(data) {
+  // 4-byte big-endian length followed by data
+  const out = new Uint8Array(4 + data.length);
+  new DataView(out.buffer).setUint32(0, data.length, false);
+  out.set(data, 4);
+  return out;
+}
+function readLengthPrefixed(bits) {
+  if (bits.length < 32) throw new Error("not enough bits for length header");
+  const length = parseInt(bits.substr(0, 32), 2);
+  const needed = 32 + length * 8;
+  if (bits.length < needed) {
+    throw new Error(`declared ${length} bytes but only have ${Math.floor((bits.length - 32) / 8)} bytes of payload`);
+  }
+  return bitsToBytes(bits.substr(32, length * 8));
+}
+
+// ---------- AES-GCM key derivation + encrypt/decrypt (Web Crypto) ----------
+async function deriveKey(password, usage) {
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(password));
+  return crypto.subtle.importKey(
+    "raw", digest, { name: "AES-GCM" }, false, usage
+  );
+}
+async function encryptMessage(messageBytes, password) {
+  const key = await deriveKey(password, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, messageBytes);
+  // combine iv + ciphertext into one buffer (we need both for decrypt)
+  const out = new Uint8Array(iv.length + ct.byteLength);
+  out.set(iv, 0);
+  out.set(new Uint8Array(ct), iv.length);
+  return out;
+}
+async function decryptMessage(payloadBytes, password) {
+  const key = await deriveKey(password, ["decrypt"]);
+  const iv = payloadBytes.slice(0, 12);
+  const ct = payloadBytes.slice(12);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+  return new Uint8Array(pt);
+}
+
+// ---------- steganography: zero-width ----------
+function zwEncode(dataBytes, cover) {
+  for (const ch of cover) {
+    if (PAYLOAD_ZW.has(ch)) {
+      throw new Error("cover text already contains payload zero-width chars");
+    }
+  }
+  const payload = lengthPrefix(dataBytes);
+  const bits = bytesToBits(payload);
+  let zw = "";
+  for (const bit of bits) zw += bit === "1" ? ZWNJ : ZWS;
+  if (cover.length === 0) return zw;
+  return cover[0] + zw + cover.slice(1);
+}
+function zwDecode(text) {
+  let bits = "";
+  for (const ch of text) {
+    if (ch === ZWS) bits += "0";
+    else if (ch === ZWNJ) bits += "1";
+  }
+  if (bits.length < 32) return null;
+  try {
+    return readLengthPrefixed(bits);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---------- steganography: whitespace ----------
+function wsEncode(dataBytes, cover) {
+  if (cover.includes("\t")) {
+    throw new Error("cover text must not contain tabs");
+  }
+  for (const line of cover.split("\n")) {
+    if (line !== line.replace(/[ \t]+$/, "")) {
+      throw new Error("cover text has trailing whitespace on a line, would be misread as payload");
+    }
+  }
+  const payload = lengthPrefix(dataBytes);
+  const bits = bytesToBits(payload);
+  let lines = cover.split("\n");
+  while (lines.length < bits.length) lines.push("");
+  for (let i = 0; i < bits.length; i++) {
+    lines[i] += bits[i] === "1" ? "\t" : " ";
+  }
+  return lines.join("\n");
+}
+function wsDecode(text) {
+  let bits = "";
+  for (const line of text.split("\n")) {
+    // walk backwards from end of line, build the chunk left-to-right
+    let chunk = "";
+    for (let i = line.length - 1; i >= 0; i--) {
+      const ch = line[i];
+      if (ch === " ") chunk = "0" + chunk;
+      else if (ch === "\t") chunk = "1" + chunk;
+      else break;
+    }
+    bits += chunk;
+  }
+  if (bits.length < 32) return null;
+  try {
+    return readLengthPrefixed(bits);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---------- DOM helpers ----------
+function setStatus(id, msg, kind) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = "status show " + kind;
+}
+function clearStatus(id) {
+  const el = document.getElementById(id);
+  el.textContent = "";
+  el.className = "status";
+}
+
+// ---------- tab switching ----------
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    btn.classList.add("active");
+    const target = btn.dataset.tab;
+    document.querySelectorAll(".tab-content").forEach(c => c.style.display = "none");
+    document.getElementById("tab-" + target).style.display = "block";
+  });
+});
+
+// ---------- encode ----------
+document.getElementById("enc-btn").addEventListener("click", async () => {
+  clearStatus("enc-status");
+  const cover = document.getElementById("enc-cover").value;
+  const secret = document.getElementById("enc-secret").value;
+  const password = document.getElementById("enc-password").value;
+  const method = document.getElementById("enc-method").value;
+  if (!secret) { setStatus("enc-status", "enter a secret message", "error"); return; }
+  if (!password) { setStatus("enc-status", "enter a password", "error"); return; }
+  try {
+    const secretBytes = new TextEncoder().encode(secret);
+    const ct = await encryptMessage(secretBytes, password);
+    const stego = method === "zw" ? zwEncode(ct, cover) : wsEncode(ct, cover);
+    document.getElementById("enc-output").value = stego;
+    setStatus("enc-status", `encoded ${secret.length} chars of secret into ${stego.length} chars of cover with ${method === "zw" ? "invisible" : "trailing"} payload`, "success");
+  } catch (e) {
+    setStatus("enc-status", "error: " + e.message, "error");
+  }
+});
+document.getElementById("enc-clear").addEventListener("click", () => {
+  ["enc-cover", "enc-secret", "enc-password", "enc-output"].forEach(id => document.getElementById(id).value = "");
+  clearStatus("enc-status");
+});
+document.getElementById("enc-copy").addEventListener("click", () => {
+  const out = document.getElementById("enc-output");
+  out.select();
+  navigator.clipboard.writeText(out.value).then(() => {
+    setStatus("enc-status", "copied to clipboard", "info");
+  }).catch(() => {
+    setStatus("enc-status", "clipboard write failed - select and copy manually", "error");
+  });
+});
+
+// ---------- decode ----------
+document.getElementById("dec-btn").addEventListener("click", async () => {
+  clearStatus("dec-status");
+  const text = document.getElementById("dec-input").value;
+  const password = document.getElementById("dec-password").value;
+  const method = document.getElementById("dec-method").value;
+  if (!text) { setStatus("dec-status", "paste the stego text first", "error"); return; }
+  if (!password) { setStatus("dec-status", "enter the password", "error"); return; }
+  const ct = method === "zw" ? zwDecode(text) : wsDecode(text);
+  if (!ct) {
+    setStatus("dec-status", "no hidden message found - is the method correct?", "error");
+    return;
+  }
+  try {
+    const plain = await decryptMessage(ct, password);
+    document.getElementById("dec-output").value = new TextDecoder().decode(plain);
+    setStatus("dec-status", `extracted ${plain.length} bytes`, "success");
+  } catch (e) {
+    setStatus("dec-status", "decryption failed - wrong password or corrupted payload", "error");
+  }
+});
+document.getElementById("dec-clear").addEventListener("click", () => {
+  ["dec-input", "dec-password", "dec-output"].forEach(id => document.getElementById(id).value = "");
+  clearStatus("dec-status");
+});
+
+// ---------- detect ----------
+document.getElementById("det-btn").addEventListener("click", () => {
+  clearStatus("det-status");
+  const text = document.getElementById("det-input").value;
+  let zwCount = 0;
+  for (const ch of text) if (PAYLOAD_ZW.has(ch)) zwCount++;
+
+  let trailingTabLines = 0;
+  let trailingSpaceBitCount = 0;
+  for (const line of text.split("\n")) {
+    let trailingTabs = 0, trailingSpaces = 0;
+    for (let i = line.length - 1; i >= 0; i--) {
+      if (line[i] === "\t") { trailingTabs++; trailingSpaceBitCount++; }
+      else if (line[i] === " " && trailingTabs === 0) { trailingSpaces++; trailingSpaceBitCount++; }
+      else break;
+    }
+    if (trailingTabs > 0) trailingTabLines++;
+  }
+
+  let lines = [];
+  if (zwCount > 0) {
+    const bytes = Math.floor(zwCount / 8);
+    const declaredLen = zwCount >= 32 ? parseInt(
+      Array.from(text, ch => ch === ZWS ? "0" : ch === ZWNJ ? "1" : "")
+        .join("").substr(0, 32), 2
+    ) : 0;
+    if (declaredLen > 0 && declaredLen * 8 <= zwCount - 32) {
+      lines.push(`zero-width: found ${zwCount} invisible chars - ${bytes} bytes encoded, declared ${declaredLen} bytes payload (length header readable without password)`);
+    } else {
+      lines.push(`zero-width: found ${zwCount} invisible chars - ${bytes} bytes encoded (length header looks corrupted)`);
+    }
+  }
+  if (trailingTabLines > 0) {
+    lines.push(`whitespace: found trailing tabs on ${trailingTabLines} lines - ${trailingSpaceBitCount} bits encoded - strong indicator of a hidden payload`);
+  }
+  if (lines.length === 0) {
+    setStatus("det-status", "no hidden payload found", "info");
+  } else {
+    setStatus("det-status", lines.join("\n"), "error");
+  }
+});
+</script>
+</body>
+</html>
