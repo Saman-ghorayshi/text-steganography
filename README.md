@@ -1,6 +1,6 @@
 # text-steganography
 
-Hide secret messages inside plain text, images, or audio using four steganography methods, with password-based encryption. The hidden bytes are AES-encrypted before encoding, so even if an attacker detects the payload, they cannot read the message without the password.
+Hide secret messages inside plain text, images, audio, or video frames using five steganography methods, with password-based encryption. The hidden bytes are AES-encrypted before encoding, so even if an attacker detects the payload, they cannot read the message without the password.
 
 Live demo: https://username.github.io/text-steganography/
 
@@ -8,7 +8,7 @@ A self-contained browser demo (single HTML file, no dependencies, no backend) im
 
 ## Methods
 
-This tool implements four steganography techniques. Each has different robustness properties, so choose based on how the cover will be transported.
+This tool implements five steganography techniques. Each has different robustness properties, so choose based on how the cover will be transported.
 
 ### Zero-width Unicode
 
@@ -45,6 +45,15 @@ Hide a payload in the least-significant bit of each 16-bit signed PCM sample of 
 - Works only on 16-bit signed little-endian PCM WAVs. 8-bit unsigned, 24/32-bit float, and compressed WAVs (ADPCM, A-law) are refused explicitly because the LSB math or the re-packing would silently destroy the payload.
 - Capacity is `nframes * nchannels / 8 - 4` bytes — an 8,000-frame mono WAV at 8 kHz (1 second of audio) hides ~996 bytes; a 44,100-frame stereo WAV (1 second of CD audio) hides ~11,021 bytes.
 - Does not survive re-encoding through any lossy codec (MP3, AAC, OGG, or FLAC-conversion with re-quantization). The CLI refuses `.mp3`/`.aac`/`.ogg` output for this method.
+
+### Frames (PNG sequence LSB)
+
+Hide a payload across the least-significant bits of the R, G, and B channels of a sequence of uniform-size PNG frames. The frames are treated as one big pixel grid — one shared length prefix spans the whole sequence, not per-frame.
+
+- Each frame looks identical to the eye — pixel values change by at most 1 per channel.
+- Works only on a directory of uniform-size PNGs named `frameNNN.png`. Non-uniform dimensions are refused explicitly because the shared length header needs a predictable bit layout.
+- We use a sequence of PNGs instead of an H.264/MP4 container because H.264 quantizes DCT coefficients even at CRF 0 — LSBs in the spatial domain wouldn't round-trip. For lossless video use FFV1/HuffYUV in MKV, then convert to/from our frames dir with ffmpeg.
+- Capacity is `nframes * width * height * 3 / 8 - 4` bytes (one shared length header).
 
 ## How it works
 
@@ -110,6 +119,22 @@ $ python steg.py encode -m wav -p mypassword -s "secret" -c cover.wav -o stego.m
 error: refusing non-WAV output 'stego.mp3': lossy encoders (MP3, AAC, OGG) would destroy the sample-LSB payload
 ```
 
+Hide a secret across a directory of PNG frames:
+
+```
+# cover frames: frame000.png, frame001.png, ... (all same dimensions)
+mkdir stego_frames
+python steg.py encode -m frames -p mypassword -s "the secret payload" -c cover_frames/ -o stego_frames/
+python steg.py decode -m frames -p mypassword -i stego_frames/
+```
+
+Detect frames payload without decrypting:
+
+```
+python steg.py detect -m frames -i stego_frames/         # reports frame count + LSB distribution
+python steg.py detect -m frames --json -i stego_frames/   # machine-readable
+```
+
 Use stdin/stdout by omitting the file arguments (or passing `-`):
 
 ```
@@ -126,6 +151,7 @@ python steg.py detect -m img -i stego.png         # reports LSB distribution
 python steg.py detect -m img --json -i stego.png  # machine-readable
 python steg.py detect -m wav -i stego.wav         # reports sample-LSB distribution
 python steg.py detect -m wav --json -i stego.wav  # machine-readable
+python steg.py detect -m frames -i stego_frames/   # reports frame count + LSB distribution
 ```
 
 Same information without decrypting, from the decode verb:
@@ -179,6 +205,25 @@ with open("stego.wav", "wb") as f:
 secret_bytes = reveal_wav(stego_wav, "mypassword")
 ```
 
+For the frames method the cover is a directory of uniform PNGs:
+```python
+from steg import hide_frames, reveal_frames
+
+# encode: returns list of (filename, stego_png_bytes)
+result = hide_frames(b"meet at dawn", "mypassword", "cover_frames/")
+for fname, data in result:
+    with open(f"stego_frames/{fname}", "wb") as f:
+        f.write(data)
+
+# reveal: pass {filename: bytes} dict
+import os
+frames = {}
+for fname in sorted(os.listdir("stego_frames")):
+    with open(f"stego_frames/{fname}", "rb") as f:
+        frames[fname] = f.read()
+secret_bytes = reveal_frames(frames, "mypassword")
+```
+
 The two layers can also be used separately:
 
 ```python
@@ -191,20 +236,20 @@ recovered = decrypt_message(zw_decode(stego), "password")
 
 ## Method comparison
 
-| Property | zero-width | whitespace | image (PNG LSB) | audio (WAV 16-bit PCM LSB) |
-|---|---|---|---|---|
-| Cover type | text | text | PNG image | 16-bit signed PCM WAV |
-| Invisible to naked eye | Yes | No (trailing tabs visible in some editors) | Yes (pixel values change by at most 1) | Inaudible (sample values change by at most 1 of 65,536) |
-| Survives copy-paste | Yes | Yes | N/A (binary; copy-paste of images depends on the tool, but bits stay intact on a byte-for-byte PNG copy) | N/A (binary; depends on exact-byte transport) |
-| Survives lossy re-encode | N/A | N/A | No (JPEG, WebP destroy LSBs; only PNG and other lossless formats preserve them) | No (MP3, AAC, OGG destroy sample LSBs; only uncompressed PCM WAV preserves them) |
-| Survives whitespace stripping | Yes | No | N/A | N/A |
-| Survives Unicode sanitizing | No | Yes | N/A | N/A |
-| Cover size requirement | None | At least one line per payload bit | `width * height * 3 / 8 - 4` bytes of payload space | `nframes * nchannels / 8 - 4` bytes of payload space |
-| Capacity | Low (one bit per cover char inserted) | One bit per cover line | High (~384 KiB in 1024x1024) | Medium (~996 bytes in 1s of 8kHz mono; ~11 KiB in 1s of CD-quality stereo) |
-| Detectable by layperson | No | Possibly (trailing tabs) | No | No |
-| Detectable by steganalysis | Yes (cluster after char[0]) | Yes (trailing whitespace is rare) | Yes (LSB distribution differs from natural LSB noise) | Yes (sample-LSB distribution differs from natural LSB noise) |
+| Property | zero-width | whitespace | image (PNG LSB) | audio (WAV 16-bit PCM LSB) | frames (PNG sequence LSB) |
+|---|---|---|---|---|---|
+| Cover type | text | text | PNG image | 16-bit signed PCM WAV | dir of uniform PNGs (`frameNNN.png`) |
+| Invisible to naked eye | Yes | No (trailing tabs visible in some editors) | Yes (pixel values change by at most 1) | Inaudible (sample values change by at most 1 of 65,536) | Yes (identical to img) |
+| Survives copy-paste | Yes | Yes | N/A (binary; copy-paste of images depends on the tool, but bits stay intact on a byte-for-byte PNG copy) | N/A (binary; depends on exact-byte transport) | N/A (binary; each frame is a PNG, must be copied byte-for-byte) |
+| Survives lossy re-encode | N/A | N/A | No (JPEG, WebP destroy LSBs; only PNG and other lossless formats preserve them) | No (MP3, AAC, OGG destroy sample LSBs; only uncompressed PCM WAV preserves them) | No (H.264/MP4 quantize DCT coefficients even at CRF 0; use FFV1/HuffYUV in MKV for lossless video) |
+| Survives whitespace stripping | Yes | No | N/A | N/A | N/A |
+| Survives Unicode sanitizing | No | Yes | N/A | N/A | N/A |
+| Cover size requirement | None | At least one line per payload bit | `width * height * 3 / 8 - 4` bytes of payload space | `nframes * nchannels / 8 - 4` bytes of payload space | `nframes * width * height * 3 / 8 - 4` bytes (one shared header) |
+| Capacity | Low (one bit per cover char inserted) | One bit per cover line | High (~384 KiB in 1024x1024) | Medium (~996 bytes in 1s of 8kHz mono; ~11 KiB in 1s of CD-quality stereo) | High (scales linearly with frame count) |
+| Detectable by layperson | No | Possibly (trailing tabs) | No | No | No |
+| Detectable by steganalysis | Yes (cluster after char[0]) | Yes (trailing whitespace is rare) | Yes (LSB distribution differs from natural LSB noise) | Yes (sample-LSB distribution differs from natural LSB noise) | Yes (same as img but aggregated across frames) |
 
-Pick zero-width for text that will be read by humans and copy-pasted as text. Pick whitespace for contexts that strip zero-width characters but preserve trailing whitespace (raw text files, some source code, plain text email). Pick image if the cover is a PNG you control end-to-end — it's the highest-capacity option and survives any lossless transport, but dies the moment anyone re-encodes it lossy. Pick audio if the cover is a 16-bit PCM WAV you control end-to-end — the payload rides each sample's LSB and is inaudible, but it dies the moment anyone re-encodes it through a lossy codec (MP3, AAC, OGG) or even a lossless re-pack that re-quantizes.
+Pick zero-width for text that will be read by humans and copy-pasted as text. Pick whitespace for contexts that strip zero-width characters but preserve trailing whitespace (raw text files, some source code, plain text email). Pick image if the cover is a PNG you control end-to-end — it's the highest-capacity option and survives any lossless transport, but dies the moment anyone re-encodes it lossy. Pick audio if the cover is a 16-bit PCM WAV you control end-to-end — the payload rides each sample's LSB and is inaudible, but it dies the moment anyone re-encodes it through a lossy codec (MP3, AAC, OGG) or even a lossless re-pack that re-quantizes. Pick frames if the cover is a sequence of PNGs (e.g. extracted from a lossless video) — it's the same LSB math as image, scaled across frames, but H.264/MP4 containers are refused because lossy video codecs destroy spatial LSBs.
 
 ## Detection
 
@@ -218,6 +263,8 @@ For the image method, `python steg.py detect -m img` reports the LSB distributio
 
 For the audio method, `python steg.py detect -m wav -i stego.wav` reports the sample-LSB distribution (how many ones vs zeros across every 16-bit sample) and the same readable-header `suspicious` flag. The length header survives without the password, so `detect` can tell an attacker exactly how many bytes are hidden in the cover audio — the same honesty as the image method.
 
+For the frames method, `python steg.py detect -m frames -i stego_frames/` reports the frame count, aggregated LSB distribution across all frames, and the same readable-header `suspicious` flag. A single shared length header spans the whole sequence, so one declared length reveals how many bytes are hidden across all frames.
+
 This demonstrates a fundamental property of LSB-style steganography: it hides content from humans, not from analysis tools. The password protects the message content, not the existence of the message.
 
 ## Tests
@@ -226,7 +273,7 @@ This demonstrates a fundamental property of LSB-style steganography: it hides co
 python -m pytest tests/ -v
 ```
 
-The test suite includes round-trip tests, fuzz tests (random byte payloads across random cover sizes), edge cases (empty cover, empty payload, truncated payload, corrupted ciphertext, wrong password, Unicode cover text, 1 MB payloads, RGBA alpha preserved, 8-bit-WAV refusal, cover-too-small capacity rejection), and end-to-end tests driving the CLI through `main()`. The text, image, and audio test modules are split for clarity.
+The test suite includes round-trip tests, fuzz tests (random byte payloads across random cover sizes), edge cases (empty cover, empty payload, truncated payload, corrupted ciphertext, wrong password, Unicode cover text, 1 MB payloads, RGBA alpha preserved, 8-bit-WAV refusal, cover-too-small capacity rejection, non-uniform-frame-dims refusal), and end-to-end tests driving the CLI through `main()`. The text, image, audio, and frames test modules are split for clarity.
 
 ## Limitations
 
