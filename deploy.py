@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """One-shot deployment wizard for the text-steganography repo.
 
-Asks for your GitHub username, fixes the hardcoded links in README/demo/LICENSE
+Asks for your GitHub username, fixes the hardcoded links in README/docs/LICENSE
 to point at your live repo, commits + pushes, and enables GitHub Pages on the
-/demo folder. Assumes you already ran `gh auth login` once so `gh` has creds.
+/docs folder. Assumes you already ran `gh auth login` once so `gh` has creds.
 No tokens are read or stored by this script.
 """
 import re
@@ -50,8 +50,8 @@ def main() -> int:
                r"https://[\w-]+\.github\.io/text-steganography/",
                f"https://{username.lower()}.github.io/text-steganography/")
 
-    # demo/index.html line 235:  https://github.com/Samsha/text-steganography
-    patch_file(REPO_DIR / "demo" / "index.html",
+    # docs/index.html:  https://github.com/Samsha/text-steganography
+    patch_file(REPO_DIR / "docs" / "index.html",
                r"https://github\.com/[\w-]+/text-steganography",
                f"https://github.com/{username}/text-steganography")
 
@@ -61,7 +61,7 @@ def main() -> int:
                f"Copyright (c) 2026 {full_name}")
 
     print("committing...")
-    r = run(["git", "add", "README.md", "demo/index.html", "LICENSE"])
+    r = run(["git", "add", "README.md", "docs/index.html", "LICENSE"])
     if r.returncode != 0:
         print("git add failed:", r.stderr); return 1
     r = run(["git", "commit", "-m", "point demo and repo links at live username"])
@@ -82,8 +82,8 @@ def main() -> int:
 
     # Use gh api to set Pages branch+path.
     # First POST to enable Pages on the repo; if it already exists, PUT.
-    print("enabling GitHub Pages on branch=master, path=/demo ...")
-    pages_payload = ["-F", "source[branch]=master", "-F", "source[path]=/demo"]
+    print("enabling GitHub Pages on branch=master, path=/docs ...")
+    pages_payload = ["-F", "source[branch]=master", "-F", "source[path]=/docs"]
     r = run([
         "gh", "api",
         f"repos/{username}/text-steganography/pages",
@@ -98,7 +98,7 @@ def main() -> int:
         if r.returncode != 0:
             print("could not enable Pages via api:", r.stderr)
             print("do it in the browser: Settings -> Pages -> "
-                  "branch=master, path=/demo -> Save")
+                  "branch=master, path=/docs -> Save")
 
     print("\ndone. live URL will be:")
     print(f"  https://{username.lower()}.github.io/text-steganography/")
