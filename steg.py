@@ -757,6 +757,99 @@ def _analyze_wav(wav_bytes) -> dict:
     return base
 
 
+def _analyze_frames(stego_frames: dict) -> dict:
+    """Steganalysis on a PNG sequence: aggregate LSBs across all frames,
+    read the shared length header. Mirrors _analyze_img with a frame_count.
+    """
+    if not isinstance(stego_frames, dict):
+        raise TypeError("frames analyze input must be a dict {filename: bytes}")
+
+    Image = _require_pil()
+    import io as _io
+
+    names = sorted(stego_frames)
+    if not names:
+        raise ValueError("no frames provided")
+
+    bits = ""
+    total_channels = 0
+    ones = 0
+    frame_count = 0
+    ref_size = None
+    for name in names:
+        data = stego_frames[name]
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(f"frame {name} must be bytes")
+        try:
+            img = Image.open(_io.BytesIO(data))
+            img.load()
+        except Exception as e:
+            raise ValueError(f"stego frame {name} is not a readable image: {e}")
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        if ref_size is None:
+            ref_size = img.size
+        elif img.size != ref_size:
+            raise ValueError(
+                f"frames must have uniform dimensions: {name} is {img.size}, "
+                f"expected {ref_size}"
+            )
+        frame_count += 1
+        for px in img.getdata():
+            for ch in range(3):
+                b = px[ch] & 1
+                bits += str(b)
+                total_channels += 1
+                if b:
+                    ones += 1
+
+    zeros = total_channels - ones
+    pct_ones = ones / total_channels if total_channels else 0.0
+
+    base = {
+        "method": "frames",
+        "frame_count": frame_count,
+        "lsb_distribution": {
+            "total_channels": total_channels,
+            "ones": ones,
+            "zeros": zeros,
+            "pct_ones": round(pct_ones, 4),
+        },
+        "declared_length": None,
+        "header_corrupted": False,
+        "suspicious": False,
+        "reason": None,
+        "payload_chars": total_channels,
+        "payload_byte_count": total_channels // 8,
+    }
+
+    if len(bits) < 32:
+        return base
+    declared = int(bits[:32], 2)
+    total_bytes = (total_channels - 32) // 8
+    if declared == 0:
+        base["declared_length"] = None
+        return base
+    declared_fits = declared * 8 + 32 <= total_channels
+    if not declared_fits:
+        base["declared_length"] = declared
+        base["header_corrupted"] = True
+        base["suspicious"] = True
+        base["reason"] = (
+            f"declared {declared} bytes but frames only store "
+            f"{total_bytes} LSB bytes"
+        )
+        return base
+    base["declared_length"] = declared
+    base["suspicious"] = True
+    base["reason"] = (
+        f"LSB stream across {frame_count} frames contains a readable length "
+        f"header declaring {declared} bytes of payload that fits the sequence "
+        f"capacity ({total_bytes} LSB bytes) — random LSB noise would not"
+    )
+    return base
+
+
 def analyze(text, method: str) -> dict:
     """Report on whether `text` carries a hidden payload via `method`.
 
@@ -782,13 +875,15 @@ def analyze(text, method: str) -> dict:
       reason             - str when suspicious is True, else None
     No password required. Does not decrypt.
     """
-    if method not in ("ws", "zw", "img", "wav"):
+    if method not in ("ws", "zw", "img", "wav", "frames"):
         raise ValueError(f"unknown method: {method!r}")
 
     if method == "img":
         return _analyze_img(text)
     if method == "wav":
         return _analyze_wav(text)
+    if method == "frames":
+        return _analyze_frames(text)
 
     if not isinstance(text, str):
         raise TypeError("text must be str")
@@ -888,6 +983,22 @@ def reveal_wav(stego_wav: bytes, password: str) -> bytes:
     return decrypt_message(ct, password)
 
 
+# Frames variants: cover is a dir of PNGs, stego is a dir of PNGs.
+def hide_frames(secret: bytes, password: str, cover_dir: str):
+    """Encrypt then hide across a dir of uniform PNG frames. Returns
+    a list of (filename, stego_png_bytes) pairs."""
+    ct = encrypt_message(secret, password)
+    return frames_encode(ct, cover_dir)
+
+
+def reveal_frames(stego_frames: dict, password: str) -> bytes:
+    """Decode an LSB-frames payload then decrypt. Raises if nothing hidden."""
+    ct = frames_decode(stego_frames)
+    if not ct:
+        raise ValueError("no hidden message found in input")
+    return decrypt_message(ct, password)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -953,6 +1064,25 @@ def _wav_only(path: str) -> None:
         )
 
 
+def _read_frames_dir(dir_path: str) -> dict:
+    """Read all frame*.png files from a directory into {filename: bytes}.
+    Raises ValueError if dir is missing or has no PNGs.
+    """
+    if dir_path == "-":
+        raise ValueError("frames method requires -i DIR (a directory path)")
+    if not _os.path.isdir(dir_path):
+        raise ValueError(f"input is not a directory: {dir_path!r}")
+    pattern = _os.path.join(dir_path, "frame*.png")
+    paths = sorted(_glob.glob(pattern))
+    if not paths:
+        raise ValueError(f"no PNG files matching frame*.png in {dir_path!r}")
+    result = {}
+    for p in paths:
+        with open(p, "rb") as f:
+            result[_os.path.basename(p)] = f.read()
+    return result
+
+
 def _print_analysis(result: dict, json_output: bool) -> None:
     """Human (default) or JSON line for the analyze() result."""
     if json_output:
@@ -963,6 +1093,9 @@ def _print_analysis(result: dict, json_output: bool) -> None:
         return
     if result["method"] == "wav":
         _print_analysis_wav(result)
+        return
+    if result["method"] == "frames":
+        _print_analysis_frames(result)
         return
     if result["payload_chars"] == 0:
         print(f"[{result['method']}] no payload characters found")
@@ -1018,6 +1151,25 @@ def _print_analysis_wav(result: dict) -> None:
         print(f"[wav] reason: {result['reason']}")
 
 
+def _print_analysis_frames(result: dict) -> None:
+    """Human render of a frames analyze() result."""
+    d = result["lsb_distribution"]
+    print(f"[frames] {result['frame_count']} frames, {d['total_channels']} LSB channel bits "
+          f"({d['ones']} ones / {d['zeros']} zeros, "
+          f"{d['pct_ones']*100:.2f}% ones)")
+    if result["declared_length"] is None:
+        if not result["suspicious"]:
+            print("[frames] no readable length header in LSB stream")
+        return
+    declared = result["declared_length"]
+    note = " (header looks corrupted: declared length exceeds LSB capacity)" \
+        if result["header_corrupted"] else ""
+    flag = "SUSPICIOUS" if result["suspicious"] else "ok"
+    print(f"[frames] declared {declared} bytes payload{note} — {flag}")
+    if result["reason"]:
+        print(f"[frames] reason: {result['reason']}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="steg",
@@ -1027,11 +1179,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     enc = sub.add_parser("encode", help="hide a secret message in cover text")
-    enc.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav"], required=True,
+    enc.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav", "frames"], required=True,
                       help="ws = whitespace (space/tab at end of lines), "
                            "zw = zero-width Unicode chars, "
                            "img = PNG LSB in pixel channel bytes, "
-                           "wav = 16-bit PCM WAV sample LSB")
+                           "wav = 16-bit PCM WAV sample LSB, "
+                           "frames = PNG sequence LSB across a dir of frames")
     enc.add_argument("-p", "--password", required=True, help="encryption password")
     enc.add_argument("-s", "--secret", required=True, help="secret message text to hide")
     enc.add_argument("-c", "--cover", default="-",
@@ -1042,12 +1195,14 @@ def _build_parser() -> argparse.ArgumentParser:
                            "For -m img, must end in .png; lossy formats are refused.")
 
     dec = sub.add_parser("decode", help="extract a secret message from stego text")
-    dec.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav"], required=True,
+    dec.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav", "frames"], required=True,
                       help="ws = whitespace, zw = zero-width, img = PNG LSB, "
-                           "wav = 16-bit PCM WAV sample LSB")
+                           "wav = 16-bit PCM WAV sample LSB, "
+                           "frames = PNG sequence LSB")
     dec.add_argument("-p", "--password", required=True, help="decryption password")
     dec.add_argument("-i", "--input", default="-",
                      help="input stego text or, for -m img, stego PNG path "
+                          "or, for -m frames, stego frames dir "
                           "(default: stdin)")
     dec.add_argument("-o", "--output", default="-",
                      help="output file for secret (default: stdout)")
@@ -1060,11 +1215,13 @@ def _build_parser() -> argparse.ArgumentParser:
     det = sub.add_parser("detect",
                          help="steganalysis: detect hidden payload WITHOUT the "
                               "password. Reads the declared length header.")
-    det.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav"], required=True,
+    det.add_argument("-m", "--method", choices=["ws", "zw", "img", "wav", "frames"], required=True,
                       help="ws = whitespace, zw = zero-width, img = PNG LSB, "
-                           "wav = 16-bit PCM WAV sample LSB")
+                           "wav = 16-bit PCM WAV sample LSB, "
+                           "frames = PNG sequence LSB")
     det.add_argument("-i", "--input", default="-",
-                     help="input text to analyze (default: stdin)")
+                     help="input text to analyze, or stego PNG/WAV path, "
+                          "or stego frames dir (default: stdin)")
     det.add_argument("--json", action="store_true",
                      help="emit machine-readable JSON instead of human text")
     return parser
@@ -1086,6 +1243,20 @@ def main(argv=None) -> int:
                 cover = _read_bytes(args.cover)
                 stego = hide_wav(args.secret.encode("utf-8"), args.password, cover)
                 _write_bytes(args.output, stego)
+            elif args.method == "frames":
+                # cover is a dir, output is a dir to write stego frames into
+                out_dir = args.output
+                if out_dir == "-":
+                    print("error: -m frames requires -o OUT_DIR (a directory)", file=sys.stderr)
+                    return 2
+                if not _os.path.isdir(out_dir):
+                    print(f"error: output path is not a directory: {out_dir!r}", file=sys.stderr)
+                    return 2
+                stego_frames = hide_frames(args.secret.encode("utf-8"),
+                                          args.password, args.cover)
+                for fname, data in stego_frames:
+                    with open(_os.path.join(out_dir, fname), "wb") as f:
+                        f.write(data)
             else:
                 cover = _read_text(args.cover)
                 stego = hide(args.secret.encode("utf-8"), args.password, cover, args.method)
@@ -1105,6 +1276,31 @@ def main(argv=None) -> int:
                 return 2
             _print_analysis(result, json_output=False)
             return 0 if result["declared_length"] is not None else 2
+        if args.method == "frames" and args.analyze:
+            try:
+                frames = _read_frames_dir(args.input)
+                result = analyze(frames, "frames")
+            except (ValueError, TypeError, ImportError) as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            _print_analysis(result, json_output=False)
+            return 0 if result["declared_length"] is not None else 2
+        if args.method == "frames":
+            try:
+                frames = _read_frames_dir(args.input)
+            except (ValueError, OSError) as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            try:
+                secret = reveal_frames(frames, args.password)
+            except ValueError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            except InvalidToken:
+                print("error: wrong password or corrupted payload", file=sys.stderr)
+                return 3
+            _write_text(args.output, secret.decode("utf-8"))
+            return 0
         if args.method == "img":
             try:
                 stego = _read_bytes(args.input)
@@ -1164,6 +1360,8 @@ def main(argv=None) -> int:
         try:
             if args.method in ("img", "wav"):
                 data = _read_bytes(args.input)
+            elif args.method == "frames":
+                data = _read_frames_dir(args.input)
             else:
                 data = _read_text(args.input)
             result = analyze(data, args.method)

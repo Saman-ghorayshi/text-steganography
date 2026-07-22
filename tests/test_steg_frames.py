@@ -6,6 +6,7 @@ Requires Pillow (soft dep in steg.py). CI installs it via requirements.txt.
 import io
 import os
 import random
+import sys
 import tempfile
 
 import pytest
@@ -186,3 +187,207 @@ def test_frames_only_lsb_changes():
                     assert cpx[ch] >> 1 == spx[ch] >> 1, (
                         f"non-LSB bits changed: {cpx[ch]} -> {spx[ch]}"
                     )
+
+
+# ---------------------------------------------------------------------------
+# hide_frames / reveal_frames — encrypt+encode / decode+decrypt
+# ---------------------------------------------------------------------------
+
+from steg import hide_frames, reveal_frames, main as _steg_main
+
+
+def test_hide_frames_reveal_frames_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _make_frames_dir(tmp, 3, 64, 64)
+        secret = b"meet at dawn at the docks"
+        result = hide_frames(secret, "horse staple", d)
+        frames_dict = {name: data for name, data in result}
+        assert reveal_frames(frames_dict, "horse staple") == secret
+
+
+def test_reveal_frames_no_payload_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _make_frames_dir(tmp, 2, 32, 32)
+        # plain frames, no payload
+        frames_dict = {}
+        for i in range(2):
+            fname = f"frame{i:03d}.png"
+            with open(os.path.join(d, fname), "rb") as f:
+                frames_dict[fname] = f.read()
+        with pytest.raises(ValueError, match="no hidden message"):
+            reveal_frames(frames_dict, "pw")
+
+
+def test_reveal_frames_wrong_password_raises():
+    from cryptography.fernet import InvalidToken
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _make_frames_dir(tmp, 2, 64, 64)
+        result = hide_frames(b"the eagle flies at midnight", "right", d)
+        frames_dict = {name: data for name, data in result}
+        with pytest.raises(InvalidToken):
+            reveal_frames(frames_dict, "wrong")
+
+
+# ---------------------------------------------------------------------------
+# CLI: encode -m frames / decode -m frames via dirs
+# ---------------------------------------------------------------------------
+
+def _run_cli_frames(argv):
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    try:
+        rc = _steg_main(argv)
+        return rc, sys.stdout.getvalue(), sys.stderr.getvalue()
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+def test_cli_encode_decode_frames_via_dir():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_dir = os.path.join(tmp, "cover")
+        stego_dir = os.path.join(tmp, "stego")
+        _make_frames_dir(tmp, 3, 64, 64)
+        # _make_frames_dir puts frames in tmp/frames, move to cover_dir
+        os.rename(os.path.join(tmp, "frames"), cover_dir)
+        os.makedirs(stego_dir)
+        rc, _, err = _run_cli_frames([
+            "encode", "-m", "frames", "-p", "mypw",
+            "-s", "top secret frames payload",
+            "-c", cover_dir, "-o", stego_dir,
+        ])
+        assert rc == 0, f"encode failed: {err}"
+        # stego dir should have frame000.png..frame002.png
+        assert len(os.listdir(stego_dir)) == 3
+        rc, out, err = _run_cli_frames([
+            "decode", "-m", "frames", "-p", "mypw",
+            "-i", stego_dir,
+        ])
+        assert rc == 0, f"decode failed: {err}"
+        assert out == "top secret frames payload"
+
+
+def test_cli_encode_frames_non_dir_output_returns_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_dir = os.path.join(tmp, "cover")
+        _make_frames_dir(tmp, 1, 32, 32)
+        os.rename(os.path.join(tmp, "frames"), cover_dir)
+        rc, _, err = _run_cli_frames([
+            "encode", "-m", "frames", "-p", "pw", "-s", "secret",
+            "-c", cover_dir, "-o", "-",
+        ])
+        assert rc == 2
+        assert "dir" in err.lower() or "frames" in err.lower()
+
+
+def test_cli_encode_frames_wrong_password_returns_3():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_dir = os.path.join(tmp, "cover")
+        stego_dir = os.path.join(tmp, "stego")
+        _make_frames_dir(tmp, 2, 64, 64)
+        os.rename(os.path.join(tmp, "frames"), cover_dir)
+        os.makedirs(stego_dir)
+        rc, _, _ = _run_cli_frames([
+            "encode", "-m", "frames", "-p", "right",
+            "-s", "secret", "-c", cover_dir, "-o", stego_dir,
+        ])
+        assert rc == 0
+        rc, _, err = _run_cli_frames([
+            "decode", "-m", "frames", "-p", "wrong",
+            "-i", stego_dir,
+        ])
+        assert rc == 3
+        assert "wrong password" in err or "corrupted" in err
+
+
+def test_cli_encode_frames_cover_too_small_returns_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_dir = os.path.join(tmp, "cover")
+        stego_dir = os.path.join(tmp, "stego")
+        _make_frames_dir(tmp, 1, 4, 4)
+        os.rename(os.path.join(tmp, "frames"), cover_dir)
+        os.makedirs(stego_dir)
+        rc, _, err = _run_cli_frames([
+            "encode", "-m", "frames", "-p", "pw",
+            "-s", "x" * 200,
+            "-c", cover_dir, "-o", stego_dir,
+        ])
+        assert rc == 2
+        assert "cover too small" in err or "too short" in err or "capacity" in err
+
+
+# ---------------------------------------------------------------------------
+# detect -m frames / analyze(frames) steganalysis (no password needed)
+# ---------------------------------------------------------------------------
+
+from steg import analyze as _analyze_frames_fn
+
+
+def test_analyze_frames_reads_declared_length_without_password():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _make_frames_dir(tmp, 3, 64, 64)
+        result = hide_frames(b"a real frames secret", "pw", d)
+        frames_dict = {name: data for name, data in result}
+        r = _analyze_frames_fn(frames_dict, "frames")
+        assert r["method"] == "frames"
+        assert r["declared_length"] is not None
+        assert r["frame_count"] == 3
+        from steg import encrypt_message
+        ct = encrypt_message(b"a real frames secret", "pw")
+        assert r["declared_length"] == len(ct)
+
+
+def test_analyze_frames_on_plain_returns_none():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _make_frames_dir(tmp, 2, 32, 32, fill=0)
+        frames_dict = {}
+        for i in range(2):
+            fname = f"frame{i:03d}.png"
+            with open(os.path.join(d, fname), "rb") as f:
+                frames_dict[fname] = f.read()
+        r = _analyze_frames_fn(frames_dict, "frames")
+        assert r["declared_length"] is None
+        assert r["header_corrupted"] is False
+        assert "lsb_distribution" in r
+        assert r["suspicious"] is False
+
+
+def test_analyze_frames_marks_stego_suspicious():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _make_frames_dir(tmp, 2, 64, 64)
+        result = hide_frames(b"a real payload here ok", "pw", d)
+        frames_dict = {name: data for name, data in result}
+        r = _analyze_frames_fn(frames_dict, "frames")
+        assert r["declared_length"] is not None
+        assert r["suspicious"] is True
+        assert "reason" in r and r["reason"]
+
+
+def test_analyze_frames_rejects_non_dict():
+    with pytest.raises(TypeError):
+        _analyze_frames_fn("not a dict", "frames")
+
+
+def test_cli_detect_frames_reads_length_without_password():
+    with tempfile.TemporaryDirectory() as tmp:
+        cover_dir = os.path.join(tmp, "cover")
+        stego_dir = os.path.join(tmp, "stego")
+        _make_frames_dir(tmp, 2, 64, 64)
+        os.rename(os.path.join(tmp, "frames"), cover_dir)
+        os.makedirs(stego_dir)
+        rc, _, err = _run_cli_frames([
+            "encode", "-m", "frames", "-p", "pw",
+            "-s", "hidden frames secret",
+            "-c", cover_dir, "-o", stego_dir,
+        ])
+        assert rc == 0, f"encode failed: {err}"
+        rc, out, err = _run_cli_frames(["detect", "-m", "frames", "-i", stego_dir])
+        assert rc == 0
+        assert "declared" in out or "bytes" in out
+
+
+def test_cli_detect_frames_on_plain_exits_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _make_frames_dir(tmp, 2, 32, 32, fill=0)
+        rc, _, _ = _run_cli_frames(["detect", "-m", "frames", "-i", d])
+        assert rc == 2
