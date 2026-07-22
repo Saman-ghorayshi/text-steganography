@@ -294,6 +294,159 @@ def img_decode(stego_png: bytes) -> bytes:
     return _bits_to_bytes(bits[32:needed])
 
 
+# ---------------------------------------------------------------------------# Method: frames (PNG sequence LSB)
+# A directory of uniform-size PNGs treated as one big pixel grid. One shared
+# 4-byte length prefix spans the whole sequence — NOT per-frame. Payload bits
+# walk R,G,B LSBs in scan order across frame000, frame001, ... frameNNN.
+# ponytail: requires uniform dims (reject if any frame differs from frame 0).
+# A variable-size frame set would need uneven per-frame bit allocation — add a
+# `--allow-mixed` flag if a real use case needs it.
+# ---------------------------------------------------------------------------# Frames encode/decode work on a list of (filename, bytes) and a dict
+# {filename: bytes} respectively, so the caller (hide_frames/CLI) handles disk.
+
+import glob as _glob
+import os as _os
+
+
+def _load_frame_dir(cover_dir):
+    """Load all frameNNN.png files from a directory, sorted. Returns
+    [(filename, Image_obj), ...]. Raises ValueError if dir is missing, empty,
+    or frames have non-uniform dimensions.
+    """
+    if not _os.path.isdir(cover_dir):
+        raise ValueError(f"cover dir is not a directory: {cover_dir!r}")
+    pattern = _os.path.join(cover_dir, "frame*.png")
+    paths = sorted(_glob.glob(pattern))
+    if not paths:
+        raise ValueError(f"no PNG files matching frame*.png in {cover_dir!r}")
+    Image = _require_pil()
+    frames = []
+    ref_size = None
+    for p in paths:
+        try:
+            img = Image.open(p)
+            img.load()
+        except Exception as e:
+            raise ValueError(f"cannot read frame {p}: {e}")
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        if ref_size is None:
+            ref_size = img.size
+        elif img.size != ref_size:
+            raise ValueError(
+                f"frames must have uniform dimensions: {p} is {img.size}, "
+                f"expected {ref_size}"
+            )
+        frames.append((_os.path.basename(p), img))
+    return frames, ref_size
+
+
+def frames_capacity(cover_dir) -> int:
+    """Total LSB capacity across all frames in the directory.
+
+    Sum of (width * height * 3) // 8 per frame, minus 4 for the shared
+    length header. Raises ValueError if dir is missing/empty.
+    """
+    frames, (w, h) = _load_frame_dir(cover_dir)
+    return len(frames) * (w * h * 3) // 8 - 4
+
+
+def frames_encode(data: bytes, cover_dir: str):
+    """Hide `data` across the LSBs of a directory of uniform PNG frames.
+
+    Returns a list of (filename, stego_png_bytes) pairs, preserving the
+    sorted frame order. One shared length prefix for the whole sequence.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    Image = _require_pil()
+    frames, (w, h) = _load_frame_dir(cover_dir)
+    import io as _io
+
+    capacity = len(frames) * (w * h * 3) // 8 - 4
+    payload = _length_prefix(data)
+    if len(payload) > capacity:
+        raise ValueError(
+            f"cover too small: need {len(payload)} bytes across {len(frames)} "
+            f"frames, have {capacity}"
+        )
+    bits = _bytes_to_bits(payload)
+
+    # Walk frames in order, writing payload bits into RGB LSBs.
+    # Each frame is a fresh image with modified pixel data.
+    bit_idx = 0
+    result = []
+    for fname, img in frames:
+        pixels = list(img.getdata())
+        has_alpha = img.mode == "RGBA"
+        out = []
+        for px in pixels:
+            channels = list(px)
+            if not has_alpha and len(channels) > 3:
+                channels = channels[:3]
+            for ch in range(3):
+                if bit_idx < len(bits):
+                    channels[ch] = (channels[ch] & 0xFE) | (bits[bit_idx] == "1")
+                    bit_idx += 1
+            out.append(tuple(channels))
+        stego_img = Image.new(img.mode, img.size)
+        stego_img.putdata(out)
+        buf = _io.BytesIO()
+        stego_img.save(buf, format="PNG")
+        result.append((fname, buf.getvalue()))
+    return result
+
+
+def frames_decode(stego_frames: dict) -> bytes:
+    """Recover a payload hidden by frames_encode. `stego_frames` is a
+    {filename: png_bytes} dict. Returns the bytes (empty on malformed).
+    """
+    Image = _require_pil()
+    import io as _io
+
+    if not isinstance(stego_frames, dict):
+        raise TypeError("stego_frames must be a dict {filename: bytes}")
+
+    # Sort filenames to match encode order
+    names = sorted(stego_frames)
+    if not names:
+        return b""
+
+    bits = ""
+    ref_size = None
+    for name in names:
+        data = stego_frames[name]
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(f"frame {name} must be bytes")
+        try:
+            img = Image.open(_io.BytesIO(data))
+            img.load()
+        except Exception as e:
+            raise ValueError(f"stego frame {name} is not a readable image: {e}")
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        if ref_size is None:
+            ref_size = img.size
+        elif img.size != ref_size:
+            raise ValueError(
+                f"frames must have uniform dimensions: {name} is {img.size}, "
+                f"expected {ref_size}"
+            )
+        for px in img.getdata():
+            for ch in range(3):
+                bits += str(px[ch] & 1)
+
+    if len(bits) < 32:
+        return b""
+    declared = int(bits[:32], 2)
+    if declared == 0:
+        return b""
+    needed = 32 + declared * 8
+    if needed > len(bits):
+        return b""  # truncated / corrupted
+    return _bits_to_bytes(bits[32:needed])
+
+
 # ---------------------------------------------------------------------------
 # Method: audio (WAV 16-bit LSB)
 # Each payload bit goes into the LSB of a 16-bit signed PCM sample. One bit
