@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Frames (PNG sequence) steganography — how it works · text-steganography</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="top">
+  <span class="brand">text-steganography</span>
+  <a href="index.html">demo</a>
+  <a href="whitespace.html">whitespace · how it works</a>
+  <a href="zero-width.html">zero-width · how it works</a>
+  <a href="lsb-image.html">image · how it works</a>
+  <a href="wav-lsb.html">audio · how it works</a>
+  <a href="frames-png-sequence.html" class="active">frames · how it works</a>
+</nav>
+<main>
+  <header>
+    <h1>Frames (PNG-sequence LSB) steganography, explained from zero</h1>
+    <div class="subtitle">
+      The single-image LSB method scaled across a directory of equally-sized
+      PNG frames. One shared 4-byte length prefix lives at the start of the
+      combined pixel stream; payload bits march across frame boundaries without
+      pausing. This page walks the full pipeline by hand, shows payload bits
+      spanning two frames, and explains why PNGs — not H.264 or MP4 — are the
+      only transport that works.
+    </div>
+  </header>
+
+  <h2>1. The one-sentence idea</h2>
+  <p>
+    It is the same LSB math as the <a href="lsb-image.html">image method</a>
+    — one payload bit per R, G, B channel — but the pixel walk extends across
+    every frame in a sorted directory, with <strong>one shared 4-byte length
+    header</strong> (not a per-frame header) at the very start of the
+    combined stream.
+  </p>
+
+  <h2>2. The cast of characters</h2>
+  <table>
+    <tr><th>Thing</th><th>What it is</th><th>Role in the trick</th></tr>
+    <tr><td><code>secret</code></td><td>the message you actually want to send</td><td>encrypted first, then hidden</td></tr>
+    <tr><td><code>password</code></td><td>a string only you and the recipient know</td><td>turns the secret into unreadable ciphertext</td></tr>
+    <tr><td><code>cover dir</code></td><td>a folder of <code>frame000.png</code>, <code>frame001.png</code>, … — every frame the same pixel dimensions</td><td>camouflage; payload is written into their combined pixel LSBs</td></tr>
+    <tr><td><code>stego frames</code></td><td>the same directory after the payload has been embedded</td><td>what you actually send</td></tr>
+    <tr><td><code>pixel</code> RGB triple</td><td>e.g. <code>(64, 128, 192)</code> — three channel bytes per pixel</td><td>each channel holds one payload bit in its lowest position</td></tr>
+    <tr><td><code>LSB</code></td><td>least-significant bit, the rightmost binary digit</td><td>what we flip; the other 7 bits of each channel are untouched</td></tr>
+    <tr><td><code>shared length header</code></td><td>4 bytes (32 bits) at the very start of the pixel stream</td><td>tells the decoder how many payload bytes to read — one header for all frames</td></tr>
+  </table>
+
+  <h2>3. The full pipeline (end to end)</h2>
+  <ol class="steps">
+    <li><strong>Encrypt.</strong> The secret's UTF-8 bytes go through <code>Fernet</code> (AES-128-CBC + HMAC-SHA256) keyed by SHA-256(password). Out comes <code>ciphertext</code> — random-looking bytes. Even if someone later finds the hidden bits, they still need the password.</li>
+    <li><strong>Length-prefix.</strong> Prepend the ciphertext length as a 4-byte big-endian integer. This is the shared header — there is exactly one for the entire frame sequence.</li>
+    <li><strong>Bits.</strong> Convert <code>[4-byte length] + ciphertext</code> to one long binary string. Every byte becomes 8 characters of <code>0</code>/<code>1</code>.</li>
+    <li><strong>Walk pixels across ALL frames.</strong> Sort the cover PNGs lexicographically (<code>frame000.png</code>, <code>frame001.png</code>, …). Open the first frame, read pixels row by row. When a frame is exhausted, move to the next. For each pixel we have three channel bytes <code>(R, G, B)</code> — alpha is skipped. For each payload bit in order, take the next channel and overwrite its LSB with the bit's value. The payload bits flow seamlessly across frame boundaries.</li>
+    <li><strong>Save each frame as PNG.</strong> Re-encode every modified frame as PNG (lossless). Any other format would re-quantize and destroy the LSB payload — see §6.</li>
+    <li><strong>Send.</strong> The receiver gets a directory of images that look identical. They do not need special software beyond something that preserves PNG bytes exactly.</li>
+    <li><strong>Decode.</strong> Open frames in sorted order, read pixels row by row, channel by channel. Concatenate every LSB into one long bit string that spans all frames.</li>
+    <li><strong>Read header.</strong> First 32 bits = length in bytes. Read that many more bytes as the ciphertext.</li>
+    <li><strong>Decrypt.</strong> Feed ciphertext + password back through Fernet. Out comes the original secret. Wrong password → Fernet's HMAC rejects it, you get nothing.</li>
+  </ol>
+
+  <h2>4. The worked example, on paper</h2>
+  <p>
+    Let's hide the 1-byte secret <code>'A'</code> (= 0x41) in <strong>three</strong>
+    frames, each 2×2, using password <code>"pw"</code>. A 2×2 frame has 12
+    channel bytes (4 pixels × 3 channels); three frames give 36 channels
+    — plenty for our 40-bit payload. We'll trace every bit so you can
+    see exactly where the payload crosses from frame 1 into frame 2.
+  </p>
+
+  <h3>Step A — encrypt</h3>
+  <p>
+    <code>encrypt_message(b"A", "pw")</code> asks Fernet for ciphertext. Fernet
+    adds a random IV, so the real bytes are unpredictable; for this walkthrough
+    pretend the ciphertext comes out to exactly one byte:
+  </p>
+<pre><code>ciphertext = b"\x41"      # 1 byte, value 0100 0001
+</code></pre>
+  <p class="note info">In real use Fernet's output is much longer (it prepends a version byte, timestamp, IV, and appends an HMAC). The math is identical — just more bits.</p>
+
+  <h3>Step B — length-prefix</h3>
+  <p>The length of the ciphertext is 1. Encode 1 as a 4-byte big-endian integer, then concatenate the ciphertext:</p>
+<pre><code>length (4 bytes):  00 00 00 01
+ciphertext (1 byte): 41
+payload (5 bytes):  00 00 00 01 41
+</code></pre>
+
+  <h3>Step C — to bits</h3>
+  <p>Each byte → 8 bits. 5 bytes → 40 bits total. Three 2×2 frames give 36 channels (36 bits) — not quite enough for a 40-bit payload. In practice you'd need at least one more pixel or a fourth frame; here we add a <strong>fourth frame</strong> (4×2×2 = 48 channels) so the walkthrough fits cleanly.</p>
+<pre><code>00       00       00       01       41
+00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>So the full bit string we need to hide is:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+└────── header (32 bits) ────────┘└ payload ┘
+</code></pre>
+
+  <h3>Step D — write into pixel LSBs across frames</h3>
+  <p>Here are the four frames, each 2×2, with their starting pixel values:</p>
+
+  <p><strong>Frame 0</strong> (<code>frame000.png</code>):</p>
+<pre><code>pixel 0:  (R=64,  G=128, B=192)   binary: 01000000 10000000 11000000
+pixel 1:  (R=12,  G=200, B=33)     binary: 00001100 11001000 00100001
+pixel 2:  (R=120, G=15,  B=80)     binary: 01111000 00001111 01010000
+pixel 3:  (R=255, G=0,   B=128)    binary: 11111111 00000000 10000000
+</code></pre>
+
+  <p><strong>Frame 1</strong> (<code>frame001.png</code>):</p>
+<pre><code>pixel 4:  (R=90,  G=44,  B=170)    binary: 01011010 00101100 10101010
+pixel 5:  (R=200, G=200, B=200)    binary: 11001000 11001000 11001000
+pixel 6:  (R=10,  G=10,  B=10)     binary: 00001010 00001010 00001010
+pixel 7:  (R=77,  G=77,  B=77)     binary: 01001101 01001101 01001101
+</code></pre>
+
+  <p><strong>Frame 2</strong> (<code>frame002.png</code>):</p>
+<pre><code>pixel 8:  (R=50,  G=50,  B=50)     binary: 00110010 00110010 00110010
+pixel 9:  (R=130, G=220, B=40)     binary: 10000010 11011100 00101000
+pixel 10: (R=3,   G=199, B=255)    binary: 00000011 11000111 11111111
+pixel 11: (R=180, G=60,  B=95)     binary: 10110100 00111100 01011111
+</code></pre>
+
+  <p>We walk channels in order R, G, B within each pixel, then move to the next pixel. When frame 0 is done we move straight into frame 1 — no pause, no per-frame header.</p>
+
+  <p><strong>Frame 0 — bits 0–11</strong> (all zeros from the first 1.5 bytes of the header):</p>
+<pre><code>channels: pixel 0 R=0  G=0  B=0
+          pixel 1 R=0  G=0  B=0
+          pixel 2 R=0  G=0  B=0
+          pixel 3 R=0  G=0  B=0
+All LSBs forced to 0. (header = 00 00 00 ...)</code></pre>
+  <p>In practice many of these channels already have LSB = 0, so only a few pixels change:</p>
+<pre><code>pixel 0, R = 01000000 → 01000000  (already 0 — no change)
+pixel 1, R = 00001100 → 00001100  (already 0 — no change)
+pixel 1, G = 11001000 → 11001000  (already 0 — no change)
+pixel 2, B = 01010000 → 01010000  (already 0 — no change)
+pixel 3, G = 00000000 → 00000000  (already 0 — no change)
+pixel 3, B = 10000000 → 10000000  (already 0 — no change)
+</code></pre>
+  <p>Frame 0 consumed channels bits 0–11. Bits 12–23 of the header are still <code>00000000 00000000</code>, so we keep writing zeros into frame 1.</p>
+
+  <p><strong>Frame 1 — bits 12–23</strong> (remaining header zeros, then the length byte starts):</p>
+<pre><code>channels: pixel 4 R=0  G=0  B=0
+          pixel 5 R=0  G=0  B=0
+          pixel 6 R=0  G=0  B=0
+          pixel 7 R=0  G=0  B=0
+</code></pre>
+<pre><code>pixel 4, R = 01011010 → 01011010  (already 0)
+pixel 4, G = 00101100 → 00101100  (already 0)
+pixel 4, B = 10101010 → 10101010  (already 0)
+pixel 5, R = 11001000 → 11001000  (already 0)
+pixel 5, G = 11001000 → 11001000  (already 0)
+pixel 5, B = 11001000 → 11001000  (already 0)
+pixel 6, R = 00001010 → 00001010  (already 0)
+pixel 6, G = 00001010 → 00001010  (already 0)
+pixel 6, B = 00001010 → 00001010  (already 0)
+pixel 7, R = 01001101 → 01001100  (LSB was 1 → forced to 0)
+pixel 7, G = 01001101 → 01001100  (LSB was 1 → forced to 0)
+pixel 7, B = 01001101 → 01001100  (LSB was 1 → forced to 0)
+</code></pre>
+
+  <p><strong>Frame 2 — bits 24–39</strong> (last 8 header zeros + the <code>00000001</code> length byte + first 4 payload bits):</p>
+<pre><code>bit 24 = 0   → pixel 8, R: 00110010 → 00110010  (no change)
+bit 25 = 0   → pixel 8, G: 00110010 → 00110010  (no change)
+bit 26 = 0   → pixel 8, B: 00110010 → 00110010  (no change)
+bit 27 = 0   → pixel 9, R: 10000010 → 10000010  (no change)
+bit 28 = 0   → pixel 9, G: 11011100 → 11011100  (no change)
+bit 29 = 0   → pixel 9, B: 00101000 → 00101000  (no change)
+bit 30 = 0   → pixel 10, R: 00000011 → 00000010  (LSB was 1 → forced to 0)
+bit 31 = 0   → pixel 10, G: 11000111 → 11000111  (no change)
+────────────── header ends, payload begins ──────────────
+bit 32 = 0   → pixel 10, B: 11111111 → 11111110  (LSB was 1 → forced to 0; payload bit = 0)
+bit 33 = 1   → pixel 11, R: 10110100 → 10110101  (LSB was 0 → set to 1; payload bit = 1)
+bit 34 = 0   → pixel 11, G: 00111100 → 00111100  (already 0)
+bit 35 = 0   → pixel 11, B: 01011111 → 01011110  (LSB was 1 → forced to 0)
+</code></pre>
+  <p>Bits 36–39 (the remaining payload bits <code>0001</code>) need a fifth frame's first pixel. That's fine — the stream doesn't care which frame a bit lands in.</p>
+
+  <p class="note warn"><strong>The cross-frame boundary</strong> is where this method differs from single-image LSB: bit 23 was the last channel of pixel 7 in frame 1, and bit 24 was the first channel of pixel 8 in frame 2. There is no header, no gap, no per-frame accounting — the payload flows as if all frames were one long image.</p>
+
+  <h3>Step E — decode (reverse)</h3>
+  <p>Open frames in sorted order, read pixels row by row, channel by channel. Concatenate each LSB. You get the same 40-bit string back:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>First 32 bits → <code>int(...,2) = 1</code>, so the decoder knows to read 1 more byte. The next 8 bits → <code>01000001 = 0x41 = b"A"</code>. Hand <code>b"\x41"</code> and <code>"pw"</code> to Fernet → original secret.</p>
+
+  <h2>5. Doing it yourself</h2>
+  <ol>
+    <li>Open the demo (the <a href="index.html">demo tab</a>). To run the CLI: <code>python steg.py encode -m frames -p pw -s "secret" -c cover_frames/ -o stego_frames/</code> then <code>python steg.py decode -m frames -p pw -i stego_frames/</code>.</li>
+    <li>Pick a cover directory whose PNGs are all the same pixel dimensions. The CLI refuses to proceed if they differ — see §8.</li>
+    <li>Capacity is <code>(N × W × H × 3) / 8 − 4</code> bytes, where N = number of frames, W×H = per-frame resolution. Three 512×512 frames: <code>(3 × 512 × 512 × 3) / 8 − 4 ≈ 288 KiB</code>.</li>
+    <li>The encoder refuses non-PNG output because lossy re-encode would silently destroy the LSB payload.</li>
+  </ol>
+  <p class="note info">For a programmatic look the Python library is the canonical source: <code>from steg import hide_frames, reveal_frames</code> — takes a directory of PNGs, returns a directory of PNGs / secret bytes.</p>
+
+  <h2>6. Why PNGs — not H.264, not MP4</h2>
+  <div class="note danger">
+    <p><strong>H.264 / H.265 / VP9 quantize DCT coefficients.</strong> Even at CRF 0 (the "lossless" setting for some encoders), the codec still feeds each macroblock through the DCT → quantize → inverse-DCT pipeline. Quantization with QP=0 is mathematically lossless for <em>integer</em> DCT, but many encoders round at the floating-point stage, and profile/level constraints force coefficient clipping. A single bit flip in a pixel's LSB can shift a DCT coefficient by 1, and the encoder may not preserve it. The payload is destroyed — silently, with no error.</p>
+  </div>
+  <div class="note info">
+    <p><strong>FFV1 in MKV is the exception.</strong> FFV1 is a true lossless codec — no DCT, no quantization, bit-exact round-trip. If you need a single-file transport (instead of a directory of PNGs), encode your frames to <code>FFV1</code> in an MKV container with <code>ffmpeg -i frame%03d.png -c:v ffv1 out.mkv</code>, embed the payload into the raw frame pixels, then extract back with <code>ffmpeg -i out.mkv frame%03d.png</code>. HuffYUV and Lagarith are other lossless options. <strong>Do not use x264/x265/libvpx — they are lossy at every setting.</strong></p>
+  </div>
+
+  <h2>7. Where it fails</h2>
+  <div class="note danger">
+    <p><strong>Lossy re-encode.</strong> Sending the stego frames through any lossy pipeline — JPEG export, re-encode to H.264, upload to a platform that re-compresses images (most social media) — destroys the payload silently. The CLI refuses <code>.jpg</code>/<code>.webp</code> output for this method, but if you re-encode by hand the tool can't help you.</p>
+  </div>
+  <div class="note danger">
+    <p><strong>Frame reordering or dropping.</strong> The decoder walks frames in lexicographic sort order. If someone renames, reorders, or removes a frame, the pixel stream is scrambled and the payload is lost. There is no per-frame checksum — the shared length header is the only structural metadata.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>Non-uniform frame dimensions.</strong> If frames have different widths or heights, the pixel count per frame varies and the bit offset where one frame ends and the next begins becomes unpredictable. The shared length header assumes a known per-frame channel count. The CLI rejects non-uniform dimensions — see §8.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>Cover too small.</strong> Capacity is <code>(N × W × H × 3) / 8 − 4</code> bytes of ciphertext. A single 32×32 frame holds only <code>(32×32×3 → 3072 bits) / 8 − 4 = 380 bytes</code> minus the Fernet overhead (~57 bytes for an empty payload). For real secrets you want either high-resolution frames or many frames.</p>
+  </div>
+
+  <h2>8. Why uniform dimensions are required</h2>
+  <p>
+    The shared length header is placed at bit position 0 of the combined pixel
+    stream. To know that bit position 32 (the start of the payload) falls at a
+    specific pixel/channel within a specific frame, the decoder must know
+    exactly how many channels each frame contributes — which means every frame
+    must have the same width × height. If frame 0 were 100×100 and frame 1 were
+    90×90, the decoder would need a per-frame directory or index to locate
+    bit 32. The simpler design — one shared header, predictable bit offsets —
+    requires uniform frames.
+  </p>
+
+  <h2>9. Is it safe?</h2>
+  <p>Two separate questions. People conflate them and that's where the mistakes happen.</p>
+
+  <h3>Can the hidden message be read?</h3>
+  <div class="note safe">
+    <p><strong>Yes, against the secret's <em>contents</em>: it is encrypted.</strong> Fernet is AES-128-CBC with HMAC-SHA256 authentication. The key is SHA-256(password). Even with the stego frames and the password, the attacker still needs the password to decrypt. Wrong password → HMAC mismatch → Fernet throws <code>InvalidToken</code>, nothing leaks.</p>
+  </div>
+  <div class="note danger">
+    <p><strong>No, against the key.</strong> Key derivation is plain SHA-256 — no salt, no PBKDF2. An attacker who has the ciphertext can brute-force a weak password offline at full hash speed. Same limitation as the image and text methods; the README marks this as a known simplification.</p>
+  </div>
+
+  <h3>Is the existence of the message hidden?</h3>
+  <div class="note danger">
+    <p><strong>No.</strong> Steganography hides content from humans, not from analysis. <code>python steg.py detect -m frames -i stego_frames/</code> reads the combined LSB stream across all frames and reports the distribution of 1s vs 0s. It also reads the 4-byte shared length header (readable without any password) and tells the attacker <em>exactly how many bytes are hidden</em>. A real steganalysis aggregates the LSB histogram across all frames — a natural photo's LSBs look like random noise (~50/50 ones and zeros), but a payload-bearing frame sequence has its first ~32 LSBs dominated by the header's zero bits. Chi-square estimators and structural LSB-pair histograms amplify this signal. Our <code>detect</code> is the honest minimum sanity check, suitable for a teaching tool — a production-quality steganalyzer is named in the project plans as a polish follow-up.</p>
+  </div>
+
+  <h2>10. Limits (short version)</h2>
+  <ul>
+    <li><strong>Capacity.</strong> 3 bits per pixel per frame. Three 512×512 frames hide <code>(3 × 512 × 512 × 3) / 8 − 4 ≈ 288 KiB</code>. More frames or higher resolution = more room.</li>
+    <li><strong>Lossy transport is deadly.</strong> Any encoder that re-quantizes (H.264, JPEG, lossy WebP) destroys the payload — silently. Stick to PNGs or lossless codecs (FFV1, HuffYUV).</li>
+    <li><strong>Frame integrity is fragile.</strong> Renaming, reordering, or dropping a frame scrambles the bit stream. There's no per-frame redundancy.</li>
+    <li><strong>Steganalysis is well-studied.</strong> LSB in the spatial domain is the textbook steg method. Aggregating across frames actually makes detection <em>easier</em> — more samples, same bias.</li>
+    <li><strong>No integrity without the password.</strong> A bit flip in transit corrupts the ciphertext; Fernet's HMAC catches it but you lose the whole message — no partial recovery.</li>
+  </ul>
+
+  <h2>11. When to pick this method</h2>
+  <p>
+    Pick the frames method when you have a directory of equally-sized PNGs (e.g. video frames extracted from a lossless source) and the transport channel preserves individual files — e.g. a ZIP archive, a file share, an S3 bucket. It has higher capacity than a single image because every extra frame adds <code>W × H × 3</code> bits. For a single-image cover, use the
+    <a href="lsb-image.html">image method</a>. For text channels, try
+    <a href="whitespace.html">whitespace</a> or
+    <a href="zero-width.html">zero-width</a>. For audio, see
+    <a href="wav-lsb.html">WAV LSB</a>.
+  </p>
+
+  <footer>
+    MIT licensed. See the <a href="https://github.com/Saman-ghorayshi/text-steganography">source on GitHub</a>.
+    Part of the text-steganography teaching pages —
+    <a href="index.html">demo</a> ·
+    <a href="whitespace.html">whitespace</a> ·
+    <a href="zero-width.html">zero-width</a> ·
+    <a href="lsb-image.html">image</a> ·
+    <a href="wav-lsb.html">audio</a> ·
+    <a href="frames-png-sequence.html">frames</a>.
+  </footer>
+</main>
+</body>
+</html>
