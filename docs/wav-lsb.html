@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WAV 16-bit PCM LSB steganography — how it works · text-steganography</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="top">
+  <span class="brand">text-steganography</span>
+  <a href="index.html">demo</a>
+  <a href="whitespace.html">whitespace · how it works</a>
+  <a href="zero-width.html">zero-width · how it works</a>
+  <a href="lsb-image.html">image · how it works</a>
+  <a href="wav-lsb.html" class="active">audio · how it works</a>
+  <a href="frames-png-sequence.html">frames · how it works</a>
+</nav>
+<main>
+  <header>
+    <h1>WAV (16-bit PCM LSB) steganography, explained from zero</h1>
+    <div class="subtitle">
+      The least-significant-bit method for audio. We hide an encrypted secret in
+      the least-significant bit of each 16-bit signed PCM sample. This page
+      walks one tiny payload through every single step, shows you exactly what
+      the sample values look like, and exactly where it breaks.
+    </div>
+  </header>
+
+  <h2>1. The one-sentence idea</h2>
+  <p>
+    A 16-bit PCM sample is a signed integer in the range −32 768 to +32 767.
+    Changing the lowest bit changes the sample by at most 1 unit out of 65 536 —
+    less than one quantization step, which no human ear can detect. So every
+    sample can quietly carry one payload bit, and the audio still sounds
+    identical.
+  </p>
+
+  <h2>2. The cast of characters</h2>
+  <table>
+    <tr><th>Thing</th><th>What it is</th><th>Role in the trick</th></tr>
+    <tr><td><code>secret</code></td><td>the message you actually want to send</td><td>encrypted first, then hidden</td></tr>
+    <tr><td><code>password</code></td><td>a string only you and the recipient know</td><td>turns the secret into unreadable ciphertext</td></tr>
+    <tr><td><code>cover</code></td><td>an innocent-looking WAV file (16-bit PCM)</td><td>camouflage; payload is written into its sample LSBs</td></tr>
+    <tr><td><code>stego WAV</code></td><td>the cover with the payload stored in sample LSBs</td><td>what you actually send</td></tr>
+    <tr><td><code>16-bit signed sample</code></td><td>e.g. <code>−1 234</code> — one amplitude value in the waveform</td><td>each sample holds one payload bit in its lowest position</td></tr>
+    <tr><td><code>LSB</code></td><td>least-significant bit, the rightmost binary digit</td><td>what we flip; we don't touch the other 15 bits of any sample</td></tr>
+  </table>
+
+  <h2>3. The full pipeline (end to end)</h2>
+  <ol class="steps">
+    <li><strong>Encrypt.</strong> The secret's UTF-8 bytes go through <code>Fernet</code> (AES-128-CBC + HMAC-SHA256) keyed by SHA-256(password). Out comes <code>ciphertext</code> — random-looking bytes. Even if someone later finds the hidden bits, they still need the password.</li>
+    <li><strong>Length-prefix.</strong> Prepend the ciphertext length as a 4-byte big-endian integer. This is the header that lets the decoder know when to stop reading sample LSBs.</li>
+    <li><strong>Bits.</strong> Convert <code>[4-byte length] + ciphertext</code> to one long binary string. Every byte becomes 8 bits, MSB first (<code>{byte:08b}</code>).</li>
+    <li><strong>Walk samples.</strong> Read the cover WAV, unpack the raw audio frames as 16-bit unsigned values (<code>struct.unpack_from("&lt;H", ...)</code>). For each payload bit in order, take the next sample, clear its LSB with <code>u &amp; 0xFFFE</code>, then set it to the payload bit with a bitwise OR.</li>
+    <li><strong>Rebuild WAV.</strong> Write the modified samples back into a new WAV with identical parameters (channels, sample width, sample rate). Any other format would re-quantize and destroy the LSB payload — see §6.</li>
+    <li><strong>Send.</strong> The receiver gets a WAV that sounds identical. They do not need any special software beyond a player that reads WAV bytes exactly.</li>
+    <li><strong>Decode.</strong> Read samples in order, extract every LSB into one long bit string.</li>
+    <li><strong>Read header.</strong> First 32 bits = length in bytes. Read that many more bytes as the ciphertext.</li>
+    <li><strong>Decrypt.</strong> Feed ciphertext + password back through Fernet. Out comes the original secret. Wrong password → Fernet's HMAC rejects it, you get nothing.</li>
+  </ol>
+
+  <h2>4. The worked example, on paper</h2>
+  <p>
+    Let's hide the 1-byte secret <code>'A'</code> (= 0x41 = <code>01000001</code>)
+    in a short 16-bit mono WAV cover using password <code>"pw"</code>. We'll do
+    every step by hand so you can see the bits. (In practice the cover needs at
+    least 40 samples for this payload; we'll show the first few.)
+  </p>
+
+  <h3>Step A — encrypt</h3>
+  <p>
+    <code>hide_wav(b"A", "pw", cover_wav)</code> asks Fernet for ciphertext. Fernet
+    adds a random IV, so the real bytes are unpredictable; for this walkthrough
+    pretend the ciphertext comes out to exactly one byte:
+  </p>
+<pre><code>ciphertext = b"\x41"      # 1 byte, value 0100 0001
+</code></pre>
+  <p class="note info">In real use Fernet's output is much longer (it prepends a version byte, timestamp, IV, and appends an HMAC). The math is identical — just more bits.</p>
+
+  <h3>Step B — length-prefix</h3>
+  <p>The length of the ciphertext is 1. Encode 1 as a 4-byte big-endian integer, then concatenate the ciphertext:</p>
+<pre><code>length (4 bytes):  00 00 00 01
+ciphertext (1 byte): 41
+payload (5 bytes):  00 00 00 01 41
+</code></pre>
+
+  <h3>Step C — to bits</h3>
+  <p>Each byte → 8 bits, MSB first. 5 bytes → 40 bits total. 40 bits need 40 samples, so our cover WAV needs at least 40 PCM samples.</p>
+<pre><code>00       00       00       01       41
+00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>So the full bit string we need to hide is:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+└────── header (32 bits) ────────┘└ payload ┘
+</code></pre>
+
+  <h3>Step D — write into sample LSBs</h3>
+  <p>Assume the first few samples of the cover (in frame order, channel-by-channel) look like this:</p>
+<pre><code>sample  0:  +3200   binary: 01111101 00010000
+sample  1:  −1582   binary: 11111001 11100010
+sample  2:  +8742   binary: 00100010 01000110
+sample  3:  −423    binary: 11111110 01101001
+sample  4:  +19999  binary: 01001110 00011111
+...
+</code></pre>
+  <p>We walk samples in order — sample 0 gets bit 0, sample 1 gets bit 1, and so on. For each sample we read it as a 16-bit unsigned value, clear the LSB, then OR in the payload bit:</p>
+<pre><code>sample  0:  u = unpack("&lt;H", bytes) = 3200
+            binary: 0111110100010000
+            clear LSB: 3200 &amp; 0xFFFE = 3200  (was already 0)
+            bit 0 = 0  →  3200 | 0 = 3200
+            binary: 0111110100010000  (no change)
+
+sample  1:  u = −1582 → packed as unsigned 63954
+            binary: 1111100111100010
+            clear LSB: 63954 &amp; 0xFFFE = 63954  (was already 0)
+            bit 1 = 0  →  63954 | 0 = 63954
+            binary: 1111100111100010  (no change)
+
+sample  2:  u = 8742
+            binary: 0010001001000110
+            clear LSB: 8742 &amp; 0xFFFE = 8742  (was already 0)
+            bit 2 = 0  →  8742 | 0 = 8742  (no change)
+...
+</code></pre>
+  <p>Skip ahead to the interesting bits. The header's last byte is <code>00000001</code>, so bit 31 (the last header bit) is 1. The payload byte <code>0x41 = 01000001</code> gives us bits 32–39:</p>
+<pre><code>sample 31:  u = +11203   binary: 00101011 11010011
+            bit 31 = 1  →  clear LSB → 11202  →  11202 | 1 = 11203
+            binary: 0010101111010011  (LSB was already 1, no change)
+
+sample 32:  u = −983     unsigned: 64553   binary: 11111100 10001001
+            bit 32 = 0  →  64553 &amp; 0xFFFE = 64552  →  | 0 = 64552
+            binary: 11111100 10001000  (LSB cleared)
+
+sample 33:  u = +7421    binary: 00011101 00000101
+            bit 33 = 1  →  7421 &amp; 0xFFFE = 7420  →  | 1 = 7421
+            binary: 00011101 00000101  (LSB already 1, no change)
+
+sample 34:  u = −20450   unsigned: 45086   binary: 10101111 11101110
+            bit 34 = 0  →  45086 &amp; 0xFFFE = 45086  →  | 0 = 45086
+            (no change)
+
+sample 35:  u = +16      binary: 00000000 00010000
+            bit 35 = 0  →  16 &amp; 0xFFFE = 16  →  | 0 = 16
+            (no change)
+
+sample 36:  u = +44095   binary: 10101100 01101111
+            bit 36 = 0  →  44095 &amp; 0xFFFE = 44094  →  | 0 = 44094
+            binary: 10101100 01101110  (LSB cleared)
+
+sample 37:  u = +402     binary: 00000001 10010010
+            bit 37 = 0  →  402 &amp; 0xFFFE = 402  →  | 0 = 402
+            (no change)
+
+sample 38:  u = +999     binary: 00000011 11100111
+            bit 38 = 0  →  999 &amp; 0xFFFE = 998  →  | 0 = 998
+            binary: 00000011 11100110  (LSB cleared)
+
+sample 39:  u = −3302    unsigned: 62234   binary: 11110011 11011010
+            bit 39 = 1  →  62234 &amp; 0xFFFE = 62234  →  | 1 = 62235
+            binary: 11110011 11011011  (LSB set)
+</code></pre>
+
+  <p class="note warn"><strong>Notice the giveaway:</strong> a natural audio recording has LSBs that are roughly 50/50 ones and zeros — they're mostly noise. Our modified cover has its first ~32 LSBs almost entirely 0 because the length header is small. A steganalysis tool can detect this: see §7.</p>
+
+  <h3>Step E — decode (reverse)</h3>
+  <p>Read samples in order, extract each LSB. You get the same 40-bit string back:</p>
+<pre><code>00000000 00000000 00000000 00000001 01000001
+</code></pre>
+  <p>First 32 bits → <code>int(...,2) = 1</code>, so the decoder knows to read 1 more byte. The next 8 bits → <code>01000001 = 0x41 = b"A"</code>. Hand <code>b"\x41"</code> and <code>"pw"</code> to Fernet → original secret.</p>
+
+  <h2>5. Why only 16-bit PCM?</h2>
+  <div class="note warn">
+    <p><strong>8-bit WAV (unsigned).</strong> 8-bit PCM samples are unsigned (0–255). The LSB math differs because Python's <code>struct.pack</code>/<code>unpack</code> treats them differently, and 8-bit audio has far fewer amplitude levels — flipping the LSB changes the value by 1/256 instead of 1/65 536, which is 256× more audible. The CLI refuses 8-bit covers with <code>sampwidth != 2</code>.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>24-bit or 32-bit float WAV.</strong> These use different sample widths and bit representations. 24-bit samples need 3-byte unpack; 32-bit float samples store amplitude as IEEE 754 floats where the LSB is a sub-bit of the mantissa. The bit-twiddling (<code>&amp; 0xFFFE | bit</code>) would corrupt the value unpredictably. Different bitcodecs needed, not supported.</p>
+  </div>
+  <div class="note warn">
+    <p><strong>Compressed WAVs (ADPCM, A-law, μ-law).</strong> These are not PCM — the stored bytes are codec-encoded deltas, not raw amplitude values. Writing into their LSBs would corrupt the codec stream, producing audible glitches or silence. The <code>wave</code> stdlib module can read some of these, but the <code>sampwidth</code> check catches them.</p>
+  </div>
+
+  <h2>6. Why not MP3 / AAC / OGG?</h2>
+  <div class="note danger">
+    <p><strong>Lossy codecs destroy LSBs.</strong> MP3, AAC, and OGG Vorbis are lossy — they decompose the waveform into frequency bands (MDCT or filter banks), quantize the coefficients, then reconstruct. The reconstructed samples are <em>different</em> from the originals: every sample's LSB is re-quantized and effectively randomized. Your carefully hidden payload bits are gone — silently, with no error signal.</p>
+  </div>
+  <p>
+    This is why the CLI refuses non-WAV output. The <code>_wav_only()</code> guard
+    checks the output extension and raises <code>ValueError</code> if you try
+    <code>-o stego.mp3</code>. The underlying reason is physics: you cannot
+    hide information in a frequency-band codec that was specifically designed
+    to throw away inaudible detail. For audio steganography, the cover must be
+    lossless, and right now that means uncompressed 16-bit PCM WAV.
+  </p>
+  <p class="note info">FLAC and ALAC are lossless compressed formats that would preserve the LSBs, but Python's stdlib <code>wave</code> module doesn't read them. Supporting FLAC is a future enhancement.</p>
+
+  <h2>7. Detection</h2>
+  <p>Steganography hides content, not existence. Two things give you away:</p>
+
+  <h3>Sample-LSB distribution</h3>
+  <p>
+    A natural recording's LSBs look like random noise — roughly 50% ones, 50%
+    zeros. After embedding a small payload, the first N samples have their LSBs
+    set to the length header (which is mostly zeros for typical payloads). A
+    histogram of the first few hundred LSBs will show a suspicious skew toward 0.
+  </p>
+
+  <h3>Readable length header, no password needed</h3>
+  <p>
+    The decoder reads the first 32 sample LSBs as a 4-byte big-endian integer.
+    If that integer is a plausible payload size (non-zero, fits within the
+    WAV's total sample count), the file almost certainly contains a hidden
+    message — random LSB noise would not produce such a tight prefix. This is
+    the same signal the <code>detect</code> helper uses:
+  </p>
+<pre><code>python steg.py detect -m wav -i stego.wav
+[wav] 882000 sample LSB bits
+[wav] declared 1 bytes payload that fits the WAV capacity
+      (110 246 sample-LSB bytes) — suspicious
+</code></pre>
+  <p class="note warn"><strong>Chi-square steganalyzer.</strong> A more rigorous approach is a <a href="https://en.wikipedia.org/wiki/Chi-square_distribution">chi-square</a> test on the sample-LSB frequency: split the first N LSBs into blocks, compute the deviation from a 50/50 distribution, and flag if it's statistically significant. Our <code>detect</code> helper uses the simplest honest signal — a readable length header that fits inside the WAV's capacity — but a real steganalysis portfolio uses chi-square as the gold standard.</p>
+
+  <h2>8. Doing it yourself</h2>
+  <ol>
+    <li>Use the <a href="index.html">demo tab</a> (audio mode) or the CLI: <code>python steg.py encode -m wav -p pw -s "Hello" -c cover.wav -o stego.wav</code> then <code>python steg.py decode -m wav -p pw -i stego.wav</code>.</li>
+    <li>Pick a cover WAV that is at least a few seconds of 16-bit PCM — capacity is <code>frames × channels / 8 − 4</code> bytes. A 10-second 44.1 kHz mono WAV holds <code>441 000 / 8 − 4 ≈ 54 KiB</code>.</li>
+    <li>The encoder refuses non-WAV output (MP3, AAC, etc.) because lossy re-encode would silently destroy the LSB payload.</li>
+    <li>To detect: <code>python steg.py detect -m wav -i stego.wav</code>. No password needed — it reads the sample LSB stream directly.</li>
+  </ol>
+  <p class="note info">For a programmatic look the Python library is the canonical source: <code>from steg import hide_wav, reveal_wav</code> — takes WAV bytes, returns WAV bytes / secret bytes.</p>
+
+  <h2>9. Limits (short version)</h2>
+  <ul>
+    <li><strong>Capacity.</strong> 1 bit per sample. A 10-second 44.1 kHz mono WAV hides <code>441 000 / 8 − 4 ≈ 54 KiB</code>. Stereo doubles it. Plenty for text secrets; tiny for media.</li>
+    <li><strong>Lossy transport is deadly.</strong> Any codec that re-quantizes (MP3, AAC, OGG) destroys the payload — silently. Stick to WAV, or a lossless codec that Python can read.</li>
+    <li><strong>Steganalysis is well-studied.</strong> LSB in the temporal domain is the textbook steg method and the textbook steganalyzer target. A chi-square estimator will flag a payload-bearing WAV — pick a different cover if you need genuine secrecy.</li>
+    <li><strong>No integrity without the password.</strong> A sample flip in transit corrupts the ciphertext; Fernet's HMAC catches it but you lose the whole message — no partial recovery.</li>
+    <li><strong>16-bit PCM only.</strong> 8-bit, 24-bit, 32-bit float, and compressed WAVs (ADPCM, A-law) are refused because their sample representations are incompatible with the <code>&amp; 0xFFFE | bit</code> LSB write.</li>
+  </ul>
+
+  <h2>10. When to pick this method</h2>
+  <p>
+    Pick the audio method when your cover is a WAV file and the transport
+    channel preserves bytes — e.g. sending a WAV as a file attachment, hosting
+    it on a site that doesn't re-encode. Audio covers have huge capacity (a
+    one-minute 44.1 kHz stereo WAV holds ~630 KiB) compared to image or text
+    methods. For text-only channels, <a href="whitespace.html">whitespace</a> or
+    <a href="zero-width.html">zero-width</a> work without inventing an audio
+    file. For images, <a href="lsb-image.html">image LSB</a> is the analog —
+    same idea, different cover medium.
+  </p>
+
+  <footer>
+    MIT licensed. See the <a href="https://github.com/Saman-ghorayshi/text-steganography">source on GitHub</a>.
+    Part of the text-steganography teaching pages —
+    <a href="index.html">demo</a> ·
+    <a href="whitespace.html">whitespace</a> ·
+    <a href="zero-width.html">zero-width</a> ·
+    <a href="lsb-image.html">image</a> ·
+    <a href="wav-lsb.html">audio</a> ·
+    <a href="frames-png-sequence.html">frames</a>.
+  </footer>
+</main>
+</body>
+</html>
